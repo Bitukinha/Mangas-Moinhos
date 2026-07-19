@@ -344,13 +344,13 @@ function Index() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border bg-primary text-primary-foreground">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-4">
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-6 sm:py-4">
           <div className="flex items-center gap-3">
-            <div className="rounded-md bg-white/95 px-3 py-2">
-              <img src={logo} alt="Nutrimilho" className="h-8 w-auto" />
+            <div className="shrink-0 rounded-md bg-white/95 px-3 py-2">
+              <img src={logo} alt="Nutrimilho" className="h-8 w-auto shrink-0" />
             </div>
-            <div>
-              <h1 className="text-lg font-semibold leading-tight">
+            <div className="min-w-0">
+              <h1 className="text-base font-semibold leading-tight sm:text-lg">
                 Aderência — Limpeza de Mangas
               </h1>
               <p className="text-xs opacity-80">
@@ -369,7 +369,7 @@ function Index() {
               <button
                 key={k}
                 onClick={() => setTab(k)}
-                className={`rounded-md px-3 py-1.5 transition ${
+                className={`flex-1 rounded-md px-3 py-1.5 transition sm:flex-initial ${
                   tab === k
                     ? "bg-white text-primary shadow"
                     : "text-primary-foreground/90 hover:bg-white/10"
@@ -553,7 +553,7 @@ function Index() {
               />
             </div>
 
-            <div className="overflow-hidden rounded-xl border border-border bg-card">
+            <div className="overflow-x-auto rounded-xl border border-border bg-card">
               <table className="w-full text-sm">
                 <thead className="bg-secondary text-secondary-foreground">
                   <tr>
@@ -745,7 +745,7 @@ function Index() {
       </main>
 
       <footer className="mx-auto max-w-6xl px-6 py-6 text-center text-xs text-muted-foreground">
-        Nutrimilho · Registro da Qualidade · Rev. 01
+        © {new Date().getFullYear()} Nutrimilho - (Novaes Tech) | Todos os direitos reservados
       </footer>
 
       {drill && (
@@ -1184,7 +1184,7 @@ function HistoryTableImpl({
     (b.date + b.hour).localeCompare(a.date + a.hour),
   );
   return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
+    <div className="overflow-x-auto rounded-xl border border-border bg-card">
       <table className="w-full text-sm">
         <thead className="bg-secondary text-secondary-foreground">
           <tr>
