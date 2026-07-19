@@ -8,6 +8,11 @@ import {
   deleteRecord as deleteRecordServerFn,
 } from "@/server/records";
 import {
+  getMills,
+  addMill as addMillServerFn,
+  deleteMill as deleteMillServerFn,
+} from "@/server/mills";
+import {
   Bar as RBar,
   BarChart,
   CartesianGrid,
@@ -27,22 +32,16 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
 export const Route = createFileRoute("/")({
-  loader: () => getRecords(),
+  loader: async () => {
+    const [records, mills] = await Promise.all([getRecords(), getMills()]);
+    return { records, mills };
+  },
   component: Index,
 });
 
 type Shift = "A" | "B" | "C";
 
 type Mill = { id: string; name: string; area: string; mangas: number };
-
-const MILLS: Mill[] = [
-  { id: "M-M2", name: "M2 680 A", area: "Moagem", mangas: 4 },
-  { id: "M-M6", name: "M6 680 A", area: "Moagem", mangas: 4 },
-  { id: "M-M8", name: "M8 680 A", area: "Moagem", mangas: 4 },
-  { id: "E-M1", name: "M1 950", area: "Extrusora", mangas: 10 },
-  { id: "E-M3", name: "M3 950", area: "Extrusora", mangas: 10 },
-  { id: "E-M7", name: "M7 680 A", area: "Extrusora", mangas: 4 },
-];
 
 const SHIFTS: Shift[] = ["A", "B", "C"];
 
@@ -69,11 +68,14 @@ function daysBetween(a: string, b: string) {
 }
 
 function Index() {
-  const initialRecords = Route.useLoaderData();
+  const { records: initialRecords, mills: initialMills } = Route.useLoaderData();
   const [records, setRecords] = useState<Record[]>(initialRecords);
+  const [mills, setMills] = useState<Mill[]>(initialMills);
 
   const addRecordFn = useServerFn(addRecordServerFn);
   const deleteRecordFn = useServerFn(deleteRecordServerFn);
+  const addMillFn = useServerFn(addMillServerFn);
+  const deleteMillFn = useServerFn(deleteMillServerFn);
 
   const [from, setFrom] = useState(() => {
     const d = new Date();
@@ -81,9 +83,13 @@ function Index() {
     return d.toISOString().slice(0, 10);
   });
   const [to, setTo] = useState(todayISO);
-  const [tab, setTab] = useState<"dashboard" | "novo" | "historico">("dashboard");
+  const [tab, setTab] = useState<"dashboard" | "novo" | "historico" | "moinhos">(
+    "dashboard",
+  );
 
-  const [millFilter, setMillFilter] = useState<string[]>(() => MILLS.map((m) => m.id));
+  const [millFilter, setMillFilter] = useState<string[]>(() =>
+    initialMills.map((m) => m.id),
+  );
   const [shiftFilter, setShiftFilter] = useState<Shift[]>(() => [...SHIFTS]);
   const [statusFilter, setStatusFilter] = useState<"all" | "C" | "NC">("all");
 
@@ -99,7 +105,7 @@ function Index() {
       prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s],
     );
   const resetFilters = () => {
-    setMillFilter(MILLS.map((m) => m.id));
+    setMillFilter(mills.map((m) => m.id));
     setShiftFilter([...SHIFTS]);
     setStatusFilter("all");
   };
@@ -120,7 +126,7 @@ function Index() {
     [records, from, to, millFilter, shiftFilter, statusFilter],
   );
 
-  const activeMills = MILLS.filter((m) => millFilter.includes(m.id));
+  const activeMills = mills.filter((m) => millFilter.includes(m.id));
   const activeShifts = SHIFTS.filter((s) => shiftFilter.includes(s));
   const totalDias = daysBetween(from, to);
   const esperadoPorMoinho = totalDias * activeShifts.length;
@@ -218,13 +224,23 @@ function Index() {
     deleteRecordFn({ data: { id } }).catch((err) => console.error(err));
   };
 
+  const addMill = async (m: { name: string; area: string; mangas: number }) => {
+    const created = await addMillFn({ data: m });
+    setMills((prev) => [...prev, created]);
+  };
+  const removeMill = async (id: string) => {
+    await deleteMillFn({ data: { id } });
+    setMills((prev) => prev.filter((m) => m.id !== id));
+    setMillFilter((prev) => prev.filter((x) => x !== id));
+  };
+
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(
       wb,
       XLSX.utils.json_to_sheet(
         filtered.map((r) => {
-          const m = MILLS.find((x) => x.id === r.millId);
+          const m = mills.find((x) => x.id === r.millId);
           const nc = r.mangas.filter((x) => x === "NC").length;
           return {
             Data: r.date,
@@ -364,6 +380,7 @@ function Index() {
                 ["dashboard", "Indicador"],
                 ["novo", "Registrar"],
                 ["historico", "Histórico"],
+                ["moinhos", "Moinhos"],
               ] as const
             ).map(([k, l]) => (
               <button
@@ -437,10 +454,10 @@ function Index() {
               <div className="grid gap-4 md:grid-cols-3">
                 <div>
                   <p className="mb-2 text-xs font-medium text-muted-foreground">
-                    Moinhos ({millFilter.length}/{MILLS.length})
+                    Moinhos ({millFilter.length}/{mills.length})
                   </p>
                   <div className="flex flex-wrap gap-1.5">
-                    {MILLS.map((m) => {
+                    {mills.map((m) => {
                       const on = millFilter.includes(m.id);
                       return (
                         <button
@@ -657,7 +674,7 @@ function Index() {
                     onClick={(e: unknown) => {
                       const label = (e as { activeLabel?: string })?.activeLabel;
                       if (!label) return;
-                      const mill = MILLS.find((m) => m.name === label);
+                      const mill = mills.find((m) => m.name === label);
                       if (!mill) return;
                       openDrill(
                         `Moinho ${mill.name}`,
@@ -737,10 +754,14 @@ function Index() {
           </section>
         )}
 
-        {tab === "novo" && <NewRecordForm onAdd={addRecord} />}
+        {tab === "novo" && <NewRecordForm mills={mills} onAdd={addRecord} />}
 
         {tab === "historico" && (
-          <HistoryTable records={filtered} onDelete={removeRecord} />
+          <HistoryTable records={filtered} mills={mills} onDelete={removeRecord} />
+        )}
+
+        {tab === "moinhos" && (
+          <MillsManager mills={mills} onAdd={addMill} onDelete={removeMill} />
         )}
       </main>
 
@@ -752,6 +773,7 @@ function Index() {
         <DrillModal
           title={drill.title}
           records={drill.recs}
+          mills={mills}
           onClose={() => setDrill(null)}
         />
       )}
@@ -831,29 +853,35 @@ function Bar({ value, tone = "ader" }: { value: number; tone?: "ader" | "conf" }
   );
 }
 
-function NewRecordForm({ onAdd }: { onAdd: (r: Record) => void }) {
-  const [millId, setMillId] = useState(MILLS[0].id);
-  const mill = MILLS.find((m) => m.id === millId)!;
+function NewRecordForm({
+  mills,
+  onAdd,
+}: {
+  mills: Mill[];
+  onAdd: (r: Record) => void;
+}) {
+  const [millId, setMillId] = useState(mills[0]?.id ?? "");
+  const mill = mills.find((m) => m.id === millId) ?? mills[0];
   const [date, setDate] = useState(todayISO);
   const [shift, setShift] = useState<Shift>("A");
   const [hour, setHour] = useState("");
   const [respLimpeza, setRespLimpeza] = useState("");
   const [respMonit, setRespMonit] = useState("");
   const [mangas, setMangas] = useState<("C" | "NC")[]>(() =>
-    Array(mill.mangas).fill("C"),
+    Array(mill?.mangas ?? 0).fill("C"),
   );
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    setMangas(Array(mill.mangas).fill("C"));
-  }, [mill.mangas]);
+    setMangas(Array(mill?.mangas ?? 0).fill("C"));
+  }, [mill?.mangas]);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!respLimpeza || !respMonit || !hour) return;
+    if (!mill || !respLimpeza || !respMonit || !hour) return;
     onAdd({
       id: crypto.randomUUID(),
-      millId,
+      millId: mill.id,
       date,
       shift,
       hour,
@@ -871,6 +899,15 @@ function NewRecordForm({ onAdd }: { onAdd: (r: Record) => void }) {
   };
 
   const allC = mangas.every((x) => x === "C");
+
+  if (!mill) {
+    return (
+      <div className="mx-auto max-w-3xl rounded-xl border border-dashed border-border bg-card p-10 text-center text-sm text-muted-foreground">
+        Nenhum moinho cadastrado. Cadastre um moinho na aba "Moinhos" antes de
+        registrar uma limpeza.
+      </div>
+    );
+  }
 
   return (
     <form
@@ -891,7 +928,7 @@ function NewRecordForm({ onAdd }: { onAdd: (r: Record) => void }) {
             onChange={(e) => setMillId(e.target.value)}
             className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
           >
-            {MILLS.map((m) => (
+            {mills.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.area} — {m.name} ({m.mangas} mangás)
               </option>
@@ -1027,21 +1064,25 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function HistoryTable({
   records,
+  mills,
   onDelete,
 }: {
   records: Record[];
+  mills: Mill[];
   onDelete: (id: string) => void;
 }) {
-  return <HistoryTableImpl records={records} onDelete={onDelete} />;
+  return <HistoryTableImpl records={records} mills={mills} onDelete={onDelete} />;
 }
 
 function DrillModal({
   title,
   records,
+  mills,
   onClose,
 }: {
   title: string;
   records: Record[];
+  mills: Mill[];
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -1105,7 +1146,7 @@ function DrillModal({
               </thead>
               <tbody>
                 {sorted.map((r) => {
-                  const m = MILLS.find((x) => x.id === r.millId);
+                  const m = mills.find((x) => x.id === r.millId);
                   const ncIdx = r.mangas
                     .map((x, i) => (x === "NC" ? i + 1 : null))
                     .filter((x): x is number => x !== null);
@@ -1168,9 +1209,11 @@ function DrillModal({
 
 function HistoryTableImpl({
   records,
+  mills,
   onDelete,
 }: {
   records: Record[];
+  mills: Mill[];
   onDelete: (id: string) => void;
 }) {
   if (records.length === 0) {
@@ -1201,7 +1244,7 @@ function HistoryTableImpl({
         </thead>
         <tbody>
           {sorted.map((r) => {
-            const mill = MILLS.find((m) => m.id === r.millId);
+            const mill = mills.find((m) => m.id === r.millId);
             const ncCount = r.mangas.filter((x) => x === "NC").length;
             const conforme = ncCount === 0;
             return (
@@ -1241,6 +1284,164 @@ function HistoryTableImpl({
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function MillsManager({
+  mills,
+  onAdd,
+  onDelete,
+}: {
+  mills: Mill[];
+  onAdd: (m: { name: string; area: string; mangas: number }) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [area, setArea] = useState("");
+  const [mangas, setMangas] = useState("4");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(
+    null,
+  );
+
+  const areas = Array.from(new Set(mills.map((m) => m.area))).sort();
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const qty = Number(mangas);
+    if (!name.trim() || !area.trim() || !Number.isInteger(qty) || qty < 1) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onAdd({ name: name.trim(), area: area.trim(), mangas: qty });
+      setName("");
+      setArea("");
+      setMangas("4");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Não foi possível cadastrar o moinho.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (id: string) => {
+    setDeletingId(id);
+    setDeleteError(null);
+    try {
+      await onDelete(id);
+    } catch (err) {
+      setDeleteError({
+        id,
+        message:
+          err instanceof Error ? err.message : "Não foi possível excluir o moinho.",
+      });
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <form
+        onSubmit={submit}
+        className="space-y-4 rounded-xl border border-border bg-card p-6 shadow-sm"
+      >
+        <div>
+          <h2 className="text-lg font-semibold">Cadastrar moinho</h2>
+          <p className="text-sm text-muted-foreground">
+            Defina o nome, a área e a quantidade de mangás do moinho.
+          </p>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-3">
+          <Field label="Nome">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              placeholder="Ex.: M9 680 A"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </Field>
+          <Field label="Área">
+            <input
+              value={area}
+              onChange={(e) => setArea(e.target.value)}
+              required
+              placeholder="Ex.: Moagem"
+              list="areas-moinho"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+            <datalist id="areas-moinho">
+              {areas.map((a) => (
+                <option key={a} value={a} />
+              ))}
+            </datalist>
+          </Field>
+          <Field label="Quantidade de mangás">
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={mangas}
+              onChange={(e) => setMangas(e.target.value)}
+              required
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </Field>
+        </div>
+
+        {error && <p className="text-sm text-destructive">{error}</p>}
+
+        <button
+          type="submit"
+          disabled={saving}
+          className="rounded-md bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow hover:opacity-90 disabled:opacity-60"
+        >
+          {saving ? "Salvando…" : "Cadastrar moinho"}
+        </button>
+      </form>
+
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold">
+            Moinhos cadastrados ({mills.length})
+          </h3>
+        </div>
+        {mills.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted-foreground">
+            Nenhum moinho cadastrado.
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {mills.map((m) => (
+              <li key={m.id} className="px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium">{m.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {m.area} · {m.mangas} mangás
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => remove(m.id)}
+                    disabled={deletingId === m.id}
+                    className="rounded-md border border-input px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:border-destructive hover:text-destructive disabled:opacity-60"
+                  >
+                    {deletingId === m.id ? "Excluindo…" : "Excluir"}
+                  </button>
+                </div>
+                {deleteError?.id === m.id && (
+                  <p className="mt-2 text-xs text-destructive">{deleteError.message}</p>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }
