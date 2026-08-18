@@ -12,8 +12,8 @@ const DEFAULT_MILLS = [
   { id: "M-M2", name: "M2 680 A", area: "Moagem", mangas: 4 },
   { id: "M-M6", name: "M6 680 A", area: "Moagem", mangas: 4 },
   { id: "M-M8", name: "M8 680 A", area: "Moagem", mangas: 4 },
-  { id: "E-M1", name: "M1 950", area: "Extrusora", mangas: 10 },
-  { id: "E-M3", name: "M3 950", area: "Extrusora", mangas: 10 },
+  { id: "E-M1", name: "M1 950", area: "Extrusora", mangas: 4 },
+  { id: "E-M3", name: "M3 950", area: "Extrusora", mangas: 4 },
   { id: "E-M7", name: "M7 680 A", area: "Extrusora", mangas: 4 },
 ];
 

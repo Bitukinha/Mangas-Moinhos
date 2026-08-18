@@ -83,9 +83,9 @@ function Index() {
     return d.toISOString().slice(0, 10);
   });
   const [to, setTo] = useState(todayISO);
-  const [tab, setTab] = useState<"dashboard" | "novo" | "historico" | "moinhos">(
-    "dashboard",
-  );
+  const [tab, setTab] = useState<
+    "dashboard" | "novo" | "historico" | "pendencias" | "moinhos"
+  >("dashboard");
 
   const [millFilter, setMillFilter] = useState<string[]>(() =>
     initialMills.map((m) => m.id),
@@ -190,6 +190,49 @@ function Index() {
       conformidade: feitos ? +((conformes / feitos) * 100).toFixed(1) : 0,
     };
   });
+
+  // Pendências: combinações dia × turno × moinho sem registro no período
+  const pendencias = useMemo(() => {
+    const done = new Set(
+      records
+        .filter((r) => r.date >= from && r.date <= to)
+        .filter((r) => millFilter.includes(r.millId))
+        .filter((r) => shiftFilter.includes(r.shift))
+        .map((r) => `${r.date}|${r.shift}|${r.millId}`),
+    );
+    const list: { date: string; shift: Shift; mill: Mill }[] = [];
+    for (let i = 0; i < totalDias; i++) {
+      const d = new Date(from + "T00:00:00");
+      d.setDate(d.getDate() + i);
+      const iso = d.toISOString().slice(0, 10);
+      for (const s of activeShifts) {
+        for (const m of activeMills) {
+          if (!done.has(`${iso}|${s}|${m.id}`)) {
+            list.push({ date: iso, shift: s, mill: m });
+          }
+        }
+      }
+    }
+    return list.sort((a, b) => (b.date + b.shift).localeCompare(a.date + a.shift));
+  }, [records, from, to, millFilter, shiftFilter, totalDias, activeShifts, activeMills]);
+
+  const pendenciasPorTurno = activeShifts.map((s) => ({
+    turno: `Turno ${s}`,
+    pendencias: pendencias.filter((p) => p.shift === s).length,
+  }));
+
+  const pendenciasPorMoinho = activeMills.map((m) => ({
+    moinho: m.name,
+    pendencias: pendencias.filter((p) => p.mill.id === m.id).length,
+  }));
+
+  const pendenciasPorDia = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const p of pendencias) map.set(p.date, (map.get(p.date) ?? 0) + 1);
+    return Array.from(map.entries())
+      .map(([date, count]) => ({ date, count }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [pendencias]);
 
   const perMillChart = perMill.map((r) => ({
     moinho: r.mill.name,
@@ -380,6 +423,7 @@ function Index() {
                 ["dashboard", "Indicador"],
                 ["novo", "Registrar"],
                 ["historico", "Histórico"],
+                ["pendencias", "Pendências"],
                 ["moinhos", "Moinhos"],
               ] as const
             ).map(([k, l]) => (
@@ -758,6 +802,17 @@ function Index() {
 
         {tab === "historico" && (
           <HistoryTable records={filtered} mills={mills} onDelete={removeRecord} />
+        )}
+
+        {tab === "pendencias" && (
+          <PendenciasTab
+            from={from}
+            to={to}
+            pendencias={pendencias}
+            porTurno={pendenciasPorTurno}
+            porMoinho={pendenciasPorMoinho}
+            porDia={pendenciasPorDia}
+          />
         )}
 
         {tab === "moinhos" && (
@@ -1285,6 +1340,131 @@ function HistoryTableImpl({
         </tbody>
       </table>
     </div>
+  );
+}
+
+function PendenciasTab({
+  from,
+  to,
+  pendencias,
+  porTurno,
+  porMoinho,
+  porDia,
+}: {
+  from: string;
+  to: string;
+  pendencias: { date: string; shift: Shift; mill: Mill }[];
+  porTurno: { turno: string; pendencias: number }[];
+  porMoinho: { moinho: string; pendencias: number }[];
+  porDia: { date: string; count: number }[];
+}) {
+  return (
+    <section className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold">
+          Pendências — limpezas não registradas
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Combinações de dia, turno e moinho sem registro de limpeza entre{" "}
+          {from} e {to}.
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <KpiCard
+          title="Total de Pendências"
+          value={`${pendencias.length}`}
+          sub="registros de limpeza faltando no período"
+          tone={pendencias.length === 0 ? "good" : "bad"}
+        />
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="mb-2 text-xs font-medium text-muted-foreground">
+            Por turno
+          </p>
+          <div className="space-y-1.5">
+            {porTurno.map((t) => (
+              <div key={t.turno} className="flex items-center justify-between text-sm">
+                <span>{t.turno}</span>
+                <span
+                  className={`font-semibold ${t.pendencias === 0 ? "text-success" : "text-destructive"}`}
+                >
+                  {t.pendencias}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="mb-2 text-xs font-medium text-muted-foreground">
+            Por moinho
+          </p>
+          <div className="space-y-1.5">
+            {porMoinho.map((m) => (
+              <div key={m.moinho} className="flex items-center justify-between text-sm">
+                <span>{m.moinho}</span>
+                <span
+                  className={`font-semibold ${m.pendencias === 0 ? "text-success" : "text-destructive"}`}
+                >
+                  {m.pendencias}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {porDia.length > 0 && (
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="mb-2 text-xs font-medium text-muted-foreground">
+            Por dia
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {porDia.map((d) => (
+              <span
+                key={d.date}
+                className="rounded-full border border-destructive/30 bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive"
+              >
+                {d.date}: {d.count}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <table className="w-full text-sm">
+          <thead className="bg-secondary text-secondary-foreground">
+            <tr>
+              <th className="px-4 py-2 text-left">Data</th>
+              <th className="px-4 py-2 text-left">Turno</th>
+              <th className="px-4 py-2 text-left">Moinho</th>
+              <th className="px-4 py-2 text-left">Área</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pendencias.length === 0 ? (
+              <tr>
+                <td colSpan={4} className="px-4 py-10 text-center text-muted-foreground">
+                  Nenhuma pendência no período selecionado.
+                </td>
+              </tr>
+            ) : (
+              pendencias.map((p) => (
+                <tr
+                  key={`${p.date}|${p.shift}|${p.mill.id}`}
+                  className="border-t border-border"
+                >
+                  <td className="px-4 py-2">{p.date}</td>
+                  <td className="px-4 py-2">Turno {p.shift}</td>
+                  <td className="px-4 py-2 font-medium">{p.mill.name}</td>
+                  <td className="px-4 py-2 text-muted-foreground">{p.mill.area}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
