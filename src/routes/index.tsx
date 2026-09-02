@@ -397,6 +397,51 @@ function Index() {
       styles: { fontSize: 9 },
       headStyles: { fillColor: [30, 90, 50] },
     });
+    const registrosOrdenados = [...filtered].sort((a, b) =>
+      (b.date + b.hour).localeCompare(a.date + a.hour),
+    );
+    y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+    autoTable(doc, {
+      startY: y,
+      head: [
+        [
+          "Data",
+          "Turno",
+          "Hora",
+          "Moinho",
+          "Área",
+          "Mangás C",
+          "Mangás NC",
+          "Status",
+          "Resp. Limpeza",
+          "Resp. Monitoramento",
+        ],
+      ],
+      body: registrosOrdenados.map((r) => {
+        const m = mills.find((x) => x.id === r.millId);
+        const nc = r.mangas.filter((x) => x === "NC").length;
+        return [
+          r.date,
+          r.shift,
+          r.hour,
+          m?.name ?? "",
+          m?.area ?? "",
+          r.mangas.length - nc,
+          nc,
+          nc === 0 ? "C" : "NC",
+          r.responsavelLimpeza,
+          r.responsavelMonitoramento,
+        ];
+      }),
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [30, 90, 50] },
+      didParseCell: (data) => {
+        if (data.section === "body" && data.column.index === 7) {
+          data.cell.styles.textColor = data.cell.raw === "NC" ? [180, 40, 40] : [30, 120, 60];
+          data.cell.styles.fontStyle = "bold";
+        }
+      },
+    });
     doc.save(`aderencia_limpeza_${from}_a_${to}.pdf`);
   };
 
