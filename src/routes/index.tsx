@@ -6,6 +6,7 @@ import {
   getRecords,
   addRecord as addRecordServerFn,
   deleteRecord as deleteRecordServerFn,
+  updateRecord as updateRecordServerFn,
 } from "@/server/records";
 import {
   getMills,
@@ -167,6 +168,7 @@ function Index() {
 
   const addRecordFn = useServerFn(addRecordServerFn);
   const deleteRecordFn = useServerFn(deleteRecordServerFn);
+  const updateRecordFn = useServerFn(updateRecordServerFn);
   const addMillFn = useServerFn(addMillServerFn);
   const deleteMillFn = useServerFn(deleteMillServerFn);
   const addWashFn = useServerFn(addWashServerFn);
@@ -199,6 +201,7 @@ function Index() {
   const [statusFilter, setStatusFilter] = useState<"all" | "C" | "NC">("all");
 
   const [drill, setDrill] = useState<{ title: string; recs: Record[] } | null>(null);
+  const [editing, setEditing] = useState<Record | null>(null);
   const openDrill = (title: string, recs: Record[]) => setDrill({ title, recs });
 
   const toggleMill = (id: string) =>
@@ -363,6 +366,15 @@ function Index() {
     addRecordFn({ data: r }).catch((err) => {
       console.error(err);
       setRecords((prev) => prev.filter((x) => x.id !== r.id));
+    });
+  };
+  const updateRecord = (r: Record) => {
+    const previous = records.find((x) => x.id === r.id);
+    setRecords((prev) => prev.map((x) => (x.id === r.id ? r : x)));
+    updateRecordFn({ data: r }).catch((err) => {
+      console.error(err);
+      if (previous)
+        setRecords((prev) => prev.map((x) => (x.id === r.id ? previous : x)));
     });
   };
   const removeRecord = (id: string) => {
@@ -1102,7 +1114,12 @@ function Index() {
         )}
 
         {tab === "historico" && (
-          <HistoryTable records={filtered} mills={mills} onDelete={removeRecord} />
+          <HistoryTable
+            records={filtered}
+            mills={mills}
+            onEdit={setEditing}
+            onDelete={removeRecord}
+          />
         )}
 
         {tab === "pendencias" && (
@@ -1144,6 +1161,19 @@ function Index() {
       <footer className="mx-auto max-w-6xl px-6 py-6 text-center text-xs text-muted-foreground">
         © {new Date().getFullYear()} Nutrimilho - (Novaes Tech) | Todos os direitos reservados
       </footer>
+
+      {editing && (
+        <EditRecordModal
+          record={editing}
+          mills={mills}
+          people={people}
+          onSave={(r) => {
+            updateRecord(r);
+            setEditing(null);
+          }}
+          onClose={() => setEditing(null)}
+        />
+      )}
 
       {drill && (
         <DrillModal
@@ -1234,35 +1264,45 @@ function NewRecordForm({
   people,
   onAdd,
   onManagePeople,
+  initial,
+  onCancel,
 }: {
   mills: Mill[];
   people: Person[];
   onAdd: (r: Record) => void;
-  onManagePeople: () => void;
+  onManagePeople?: () => void;
+  // Quando informado, o formulário edita este registro em vez de criar um novo.
+  initial?: Record;
+  onCancel?: () => void;
 }) {
   const limpezaPeople = people.filter((p) => p.limpeza);
   const monitPeople = people.filter((p) => p.monitoramento);
-  const [millId, setMillId] = useState(mills[0]?.id ?? "");
+  const [millId, setMillId] = useState(initial?.millId ?? mills[0]?.id ?? "");
   const mill = mills.find((m) => m.id === millId) ?? mills[0];
-  const [date, setDate] = useState(() => currentShift(new Date()).date);
-  const [shift, setShift] = useState<Shift>(() => currentShift(new Date()).shift);
-  const [hour, setHour] = useState("");
-  const [respLimpeza, setRespLimpeza] = useState("");
-  const [respMonit, setRespMonit] = useState("");
-  const [mangas, setMangas] = useState<("C" | "NC")[]>(() =>
-    Array(mill?.mangas ?? 0).fill("C"),
+  const [date, setDate] = useState(() => initial?.date ?? currentShift(new Date()).date);
+  const [shift, setShift] = useState<Shift>(
+    () => initial?.shift ?? currentShift(new Date()).shift,
+  );
+  const [hour, setHour] = useState(initial?.hour ?? "");
+  const [respLimpeza, setRespLimpeza] = useState(initial?.responsavelLimpeza ?? "");
+  const [respMonit, setRespMonit] = useState(initial?.responsavelMonitoramento ?? "");
+  const [mangas, setMangas] = useState<("C" | "NC")[]>(
+    () => initial?.mangas ?? Array(mill?.mangas ?? 0).fill("C"),
   );
   const [saved, setSaved] = useState(false);
 
+  // Mantém o status já marcado se a quantidade de mangás não mudou
+  // (ex.: ao abrir um registro existente para edição).
   useEffect(() => {
-    setMangas(Array(mill?.mangas ?? 0).fill("C"));
+    const n = mill?.mangas ?? 0;
+    setMangas((prev) => (prev.length === n ? prev : Array(n).fill("C")));
   }, [mill?.mangas]);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!mill || !respLimpeza || !respMonit || !hour) return;
     onAdd({
-      id: crypto.randomUUID(),
+      id: initial?.id ?? crypto.randomUUID(),
       millId: mill.id,
       date,
       shift,
@@ -1270,8 +1310,9 @@ function NewRecordForm({
       responsavelLimpeza: respLimpeza,
       responsavelMonitoramento: respMonit,
       mangas,
-      createdAt: new Date().toISOString(),
+      createdAt: initial?.createdAt ?? new Date().toISOString(),
     });
+    if (initial) return;
     setHour("");
     setRespLimpeza("");
     setRespMonit("");
@@ -1294,14 +1335,20 @@ function NewRecordForm({
   return (
     <form
       onSubmit={submit}
-      className="mx-auto max-w-3xl space-y-6 rounded-xl border border-border bg-card p-6 shadow-sm"
+      className={
+        initial
+          ? "space-y-6 p-6"
+          : "mx-auto max-w-3xl space-y-6 rounded-xl border border-border bg-card p-6 shadow-sm"
+      }
     >
-      <div>
-        <h2 className="text-lg font-semibold">Novo registro de limpeza</h2>
-        <p className="text-sm text-muted-foreground">
-          1x por turno (cada final de turno). Marque cada mangá como C (conforme) ou NC.
-        </p>
-      </div>
+      {!initial && (
+        <div>
+          <h2 className="text-lg font-semibold">Novo registro de limpeza</h2>
+          <p className="text-sm text-muted-foreground">
+            1x por turno (cada final de turno). Marque cada mangá como C (conforme) ou NC.
+          </p>
+        </div>
+      )}
 
       <div className="grid gap-4 md:grid-cols-2">
         <Field label="Moinho">
@@ -1362,7 +1409,7 @@ function NewRecordForm({
           <PersonSelect value={respMonit} onChange={setRespMonit} people={monitPeople} />
         </Field>
       </div>
-      {(limpezaPeople.length === 0 || monitPeople.length === 0) && (
+      {onManagePeople && (limpezaPeople.length === 0 || monitPeople.length === 0) && (
         <p className="text-xs text-muted-foreground">
           Falta cadastrar responsáveis de{" "}
           {[limpezaPeople.length === 0 && "limpeza", monitPeople.length === 0 && "monitoramento"]
@@ -1428,8 +1475,17 @@ function NewRecordForm({
           type="submit"
           className="rounded-md bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow hover:opacity-90"
         >
-          Salvar registro
+          {initial ? "Salvar alterações" : "Salvar registro"}
         </button>
+        {onCancel && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-md border border-input px-5 py-2.5 text-sm font-medium hover:bg-muted"
+          >
+            Cancelar
+          </button>
+        )}
         {saved && <span className="text-sm text-success">✓ Registro salvo</span>}
       </div>
     </form>
@@ -1450,13 +1506,72 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function HistoryTable({
   records,
   mills,
+  onEdit,
   onDelete,
 }: {
   records: Record[];
   mills: Mill[];
+  onEdit: (r: Record) => void;
   onDelete: (id: string) => void;
 }) {
-  return <HistoryTableImpl records={records} mills={mills} onDelete={onDelete} />;
+  return (
+    <HistoryTableImpl records={records} mills={mills} onEdit={onEdit} onDelete={onDelete} />
+  );
+}
+
+function EditRecordModal({
+  record,
+  mills,
+  people,
+  onSave,
+  onClose,
+}: {
+  record: Record;
+  mills: Mill[];
+  people: Person[];
+  onSave: (r: Record) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = "";
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-xl border border-border bg-card shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-border bg-primary px-5 py-3 text-primary-foreground">
+          <h3 className="text-base font-semibold">Editar registro de limpeza</h3>
+          <button
+            onClick={onClose}
+            className="rounded-md bg-white/10 px-3 py-1.5 text-sm hover:bg-white/20"
+          >
+            Fechar ✕
+          </button>
+        </div>
+        <NewRecordForm
+          mills={mills}
+          people={people}
+          initial={record}
+          onAdd={onSave}
+          onCancel={onClose}
+        />
+      </div>
+    </div>
+  );
 }
 
 function DrillModal({
@@ -1595,10 +1710,12 @@ function DrillModal({
 function HistoryTableImpl({
   records,
   mills,
+  onEdit,
   onDelete,
 }: {
   records: Record[];
   mills: Mill[];
+  onEdit: (r: Record) => void;
   onDelete: (id: string) => void;
 }) {
   if (records.length === 0) {
@@ -1656,7 +1773,13 @@ function HistoryTableImpl({
                     {conforme ? "C" : "NC"}
                   </span>
                 </td>
-                <td className="px-3 py-2 text-right">
+                <td className="whitespace-nowrap px-3 py-2 text-right">
+                  <button
+                    onClick={() => onEdit(r)}
+                    className="mr-3 text-xs text-muted-foreground hover:text-primary"
+                  >
+                    Editar
+                  </button>
                   <button
                     onClick={() => onDelete(r.id)}
                     className="text-xs text-muted-foreground hover:text-destructive"
@@ -2550,6 +2673,10 @@ function PersonSelect({
       <option value="" disabled>
         {people.length === 0 ? "Nenhum responsável cadastrado" : "Selecione…"}
       </option>
+      {/* Mantém visível um nome que já não está entre os cadastrados (registros antigos). */}
+      {value && !people.some((p) => p.name === value) && (
+        <option value={value}>{value}</option>
+      )}
       {people.map((p) => (
         <option key={p.id} value={p.name}>
           {p.name}

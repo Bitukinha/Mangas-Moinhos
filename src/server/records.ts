@@ -78,3 +78,20 @@ export const deleteRecord = createServerFn({ method: "POST" })
     await sql()`delete from records where id = ${data.id}`;
     return { id: data.id };
   });
+
+export const updateRecord = createServerFn({ method: "POST" })
+  .validator(RecordInput)
+  .handler(async ({ data }) => {
+    await sql()`
+      update records set
+        mill_id = ${data.millId},
+        date = ${data.date},
+        shift = ${data.shift},
+        hour = ${data.hour},
+        responsavel_limpeza = ${data.responsavelLimpeza},
+        responsavel_monitoramento = ${data.responsavelMonitoramento},
+        mangas = ${JSON.stringify(data.mangas)}
+      where id = ${data.id}
+    `;
+    return data;
+  });
