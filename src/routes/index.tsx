@@ -1905,6 +1905,11 @@ function PeriodFilter({
 // Lavagem das mangas: 1x a cada 10 dias por moinho, independente de turno.
 // Escala 6x1 com folga aos domingos: prazo que cai no domingo vai para segunda.
 const WASH_INTERVAL_DAYS = 10;
+// Início do controle de lavagem: nenhum vencimento antes desta data é cobrado.
+const WASH_START = "2026-10-01";
+
+// Ponto de partida da contagem para quem ainda não tem lavagem registrada.
+const WASH_FIRST_START = addDaysISO(WASH_START, -1);
 
 function washDeadline(iso: string) {
   return weekdayISO(iso) === 0 ? addDaysISO(iso, 1) : iso;
@@ -1936,8 +1941,9 @@ function computeWashCycles(
 ): WashCycle[] {
   const sorted = [...millWashes].sort((a, b) => a.date.localeCompare(b.date));
   const prev = [...sorted].reverse().find((w) => w.date < from);
-  // Sem lavagem anterior: o primeiro ciclo são os primeiros 10 dias do período.
-  let start = prev ? prev.date : addDaysISO(from, -1);
+  // Sem lavagem anterior: o primeiro ciclo são os primeiros 10 dias desde o início do controle.
+  let start = prev ? prev.date : WASH_FIRST_START;
+  const minDue = from > WASH_START ? from : WASH_START;
   let i = sorted.findIndex((w) => w.date > start);
   if (i < 0) i = sorted.length;
   const cycles: WashCycle[] = [];
@@ -1961,7 +1967,7 @@ function computeWashCycles(
     } else {
       break; // ciclo em aberto, ainda dentro do prazo
     }
-    if (due >= from) cycles.push(cycle);
+    if (due >= minDue) cycles.push(cycle);
   }
   return cycles;
 }
@@ -1991,8 +1997,10 @@ function summarizeWashes(mills: Mill[], washes: Wash[], from: string, to: string
       (acc, w) => (!acc || w.date > acc.date ? w : acc),
       undefined,
     );
-    const proxima = last ? washDeadline(addDaysISO(last.date, WASH_INTERVAL_DAYS)) : null;
-    const diasParaProxima = proxima ? daysDiff(today, proxima) : null;
+    const proxima = washDeadline(
+      addDaysISO(last ? last.date : WASH_FIRST_START, WASH_INTERVAL_DAYS),
+    );
+    const diasParaProxima = daysDiff(today, proxima);
     return {
       mill: m,
       cycles,
@@ -2012,7 +2020,7 @@ function summarizeWashes(mills: Mill[], washes: Wash[], from: string, to: string
   const totalNaoRealizadas = perMill.reduce((a, p) => a + p.naoRealizadas, 0);
   const aderenciaGeral = allCycles.length ? (totalNoPrazo / allCycles.length) * 100 : 0;
   const vencidos = perMill.filter(
-    (p) => p.diasParaProxima === null || p.diasParaProxima < 0,
+    (p) => p.diasParaProxima < 0,
   ).length;
 
   const lavagensPeriodo = washes
@@ -2079,7 +2087,8 @@ function LavagemTab({
         <p className="text-sm text-muted-foreground">
           1 lavagem a cada {WASH_INTERVAL_DAYS} dias por moinho, independente de turno.
           Escala 6x1 com folga aos domingos: prazo que cai no domingo passa para segunda.
-          A contagem reinicia a partir da data da última lavagem.
+          A contagem reinicia a partir da data da última lavagem. Controle iniciado em{" "}
+          {formatBR(WASH_START)}.
         </p>
       </div>
 
@@ -2139,15 +2148,13 @@ function LavagemTab({
             {perMill.map((p) => {
               const d = p.diasParaProxima;
               const badge =
-                d === null
-                  ? { text: "Sem registro", cls: "bg-destructive/15 text-destructive" }
-                  : d < 0
-                    ? { text: `Atrasada ${-d} dia(s)`, cls: "bg-destructive/15 text-destructive" }
-                    : d === 0
-                      ? { text: "Vence hoje", cls: "bg-accent/40 text-accent-foreground" }
-                      : d <= 2
-                        ? { text: `Vence em ${d} dia(s)`, cls: "bg-accent/40 text-accent-foreground" }
-                        : { text: `Em dia (${d} dias)`, cls: "bg-success/15 text-success" };
+                d < 0
+                  ? { text: `Atrasada ${-d} dia(s)`, cls: "bg-destructive/15 text-destructive" }
+                  : d === 0
+                    ? { text: "Vence hoje", cls: "bg-accent/40 text-accent-foreground" }
+                    : d <= 2
+                      ? { text: `Vence em ${d} dia(s)`, cls: "bg-accent/40 text-accent-foreground" }
+                      : { text: `Em dia (${d} dias)`, cls: "bg-success/15 text-success" };
               return (
                 <tr key={p.mill.id} className="border-t border-border">
                   <td className="px-4 py-3">
@@ -2156,14 +2163,12 @@ function LavagemTab({
                   </td>
                   <td className="px-4 py-3">{p.last ? formatBR(p.last.date) : "—"}</td>
                   <td className="px-4 py-3">
-                    {p.proxima && (
-                      <div>
-                        {formatBR(p.proxima)}{" "}
-                        <span className="text-xs text-muted-foreground">
-                          ({WEEKDAYS[weekdayISO(p.proxima)]})
-                        </span>
-                      </div>
-                    )}
+                    <div>
+                      {formatBR(p.proxima)}{" "}
+                      <span className="text-xs text-muted-foreground">
+                        ({WEEKDAYS[weekdayISO(p.proxima)]})
+                      </span>
+                    </div>
                     <span
                       className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${badge.cls}`}
                     >
