@@ -18,6 +18,11 @@ import {
   deleteWash as deleteWashServerFn,
 } from "@/server/washes";
 import {
+  getPeople,
+  addPerson as addPersonServerFn,
+  deletePerson as deletePersonServerFn,
+} from "@/server/people";
+import {
   Bar as RBar,
   BarChart,
   CartesianGrid,
@@ -38,12 +43,13 @@ import autoTable from "jspdf-autotable";
 
 export const Route = createFileRoute("/")({
   loader: async () => {
-    const [records, mills, washes] = await Promise.all([
+    const [records, mills, washes, people] = await Promise.all([
       getRecords(),
       getMills(),
       getWashes(),
+      getPeople(),
     ]);
-    return { records, mills, washes };
+    return { records, mills, washes, people };
   },
   component: Index,
 });
@@ -52,7 +58,53 @@ type Shift = "A" | "B" | "C";
 
 type Mill = { id: string; name: string; area: string; mangas: number };
 
+type Person = { id: string; name: string; limpeza: boolean; monitoramento: boolean };
+
 const SHIFTS: Shift[] = ["A", "B", "C"];
+
+// Horário dos turnos. O turno C pertence ao dia em que termina
+// (C de 02/10 = 22:40 de 01/10 até 06:00 de 02/10), como a equipe já registra.
+const SHIFT_TIMES: { [K in Shift]: { start: string; end: string } } = {
+  A: { start: "06:00", end: "14:20" },
+  B: { start: "14:20", end: "22:40" },
+  C: { start: "22:40", end: "06:00" },
+};
+
+function localISO(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function atTime(iso: string, hhmm: string) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const [y, mo, d] = iso.split("-").map(Number);
+  return new Date(y, mo - 1, d, h, m);
+}
+
+function shiftEnd(iso: string, shift: Shift) {
+  return atTime(iso, SHIFT_TIMES[shift].end);
+}
+
+function shiftDay(iso: string, delta: number) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return localISO(new Date(y, m - 1, d + delta));
+}
+
+// Turno em andamento e o dia ao qual ele pertence.
+function currentShift(now: Date): { date: string; shift: Shift } {
+  const today = localISO(now);
+  const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  if (hhmm < SHIFT_TIMES.A.start) return { date: today, shift: "C" };
+  if (hhmm < SHIFT_TIMES.B.start) return { date: today, shift: "A" };
+  if (hhmm < SHIFT_TIMES.C.start) return { date: today, shift: "B" };
+  return { date: shiftDay(today, 1), shift: "C" };
+}
+
+// Ordem dentro do dia: C (madrugada), A, B.
+function previousShift({ date, shift }: { date: string; shift: Shift }) {
+  if (shift === "C") return { date: shiftDay(date, -1), shift: "B" as Shift };
+  return { date, shift: (shift === "B" ? "A" : "C") as Shift };
+}
 
 type Record = {
   id: string;
@@ -78,9 +130,7 @@ type Wash = {
 
 // Data local (evita virar o dia antes da meia-noite por causa do UTC)
 function todayISO() {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return localISO(new Date());
 }
 
 function monthStartISO() {
@@ -108,10 +158,12 @@ function Index() {
     records: initialRecords,
     mills: initialMills,
     washes: initialWashes,
+    people: initialPeople,
   } = Route.useLoaderData();
   const [records, setRecords] = useState<Record[]>(initialRecords);
   const [mills, setMills] = useState<Mill[]>(initialMills);
   const [washes, setWashes] = useState<Wash[]>(initialWashes);
+  const [people, setPeople] = useState<Person[]>(initialPeople);
 
   const addRecordFn = useServerFn(addRecordServerFn);
   const deleteRecordFn = useServerFn(deleteRecordServerFn);
@@ -119,6 +171,8 @@ function Index() {
   const deleteMillFn = useServerFn(deleteMillServerFn);
   const addWashFn = useServerFn(addWashServerFn);
   const deleteWashFn = useServerFn(deleteWashServerFn);
+  const addPersonFn = useServerFn(addPersonServerFn);
+  const deletePersonFn = useServerFn(deletePersonServerFn);
 
   // Padrão: mês atual (do dia 1 até hoje). Outras datas pelo filtro.
   const [from, setFrom] = useState(monthStartISO);
@@ -129,7 +183,13 @@ function Index() {
   };
   const isCurrentMonth = from === monthStartISO() && to === todayISO();
   const [tab, setTab] = useState<
-    "dashboard" | "novo" | "historico" | "pendencias" | "lavagem" | "moinhos"
+    | "dashboard"
+    | "novo"
+    | "historico"
+    | "pendencias"
+    | "lavagem"
+    | "moinhos"
+    | "responsaveis"
   >("dashboard");
 
   const [millFilter, setMillFilter] = useState<string[]>(() =>
@@ -244,9 +304,11 @@ function Index() {
         .map((r) => `${r.date}|${r.shift}|${r.millId}`),
     );
     const list: { date: string; shift: Shift; mill: Mill }[] = [];
+    const now = new Date();
     for (let i = 0; i < totalDias; i++) {
       const iso = addDaysISO(from, i);
       for (const s of activeShifts) {
+        if (shiftEnd(iso, s) > now) continue; // turno ainda não terminou
         for (const m of activeMills) {
           if (!done.has(`${iso}|${s}|${m.id}`)) {
             list.push({ date: iso, shift: s, mill: m });
@@ -322,6 +384,17 @@ function Index() {
   const removeWash = (id: string) => {
     setWashes((prev) => prev.filter((w) => w.id !== id));
     deleteWashFn({ data: { id } }).catch((err) => console.error(err));
+  };
+
+  const addPerson = async (p: Omit<Person, "id">) => {
+    const created = await addPersonFn({ data: p });
+    setPeople((prev) =>
+      [...prev, created].sort((a, b) => a.name.localeCompare(b.name, "pt-BR")),
+    );
+  };
+  const removePerson = async (id: string) => {
+    await deletePersonFn({ data: { id } });
+    setPeople((prev) => prev.filter((p) => p.id !== id));
   };
 
   const removeMill = async (id: string) => {
@@ -648,6 +721,7 @@ function Index() {
                 ["pendencias", "Pendências"],
                 ["lavagem", "Lavagem"],
                 ["moinhos", "Moinhos"],
+                ["responsaveis", "Responsáveis"],
               ] as const
             ).map(([k, l]) => (
               <button
@@ -667,6 +741,13 @@ function Index() {
       </header>
 
       <main className="mx-auto max-w-6xl px-6 py-8">
+        <ShiftAlerts
+          records={records}
+          mills={mills}
+          onRegister={() => setTab("novo")}
+          onPendencias={() => setTab("pendencias")}
+        />
+
         {tab === "dashboard" && (
           <section className="space-y-6">
             <div className="flex flex-wrap items-end gap-3">
@@ -1011,7 +1092,14 @@ function Index() {
           </section>
         )}
 
-        {tab === "novo" && <NewRecordForm mills={mills} onAdd={addRecord} />}
+        {tab === "novo" && (
+          <NewRecordForm
+            mills={mills}
+            people={people}
+            onAdd={addRecord}
+            onManagePeople={() => setTab("responsaveis")}
+          />
+        )}
 
         {tab === "historico" && (
           <HistoryTable records={filtered} mills={mills} onDelete={removeRecord} />
@@ -1038,6 +1126,7 @@ function Index() {
             onCurrentMonth={setCurrentMonth}
             mills={mills}
             washes={washes}
+            people={people}
             onAdd={addWash}
             onDelete={removeWash}
           />
@@ -1045,6 +1134,10 @@ function Index() {
 
         {tab === "moinhos" && (
           <MillsManager mills={mills} onAdd={addMill} onDelete={removeMill} />
+        )}
+
+        {tab === "responsaveis" && (
+          <PeopleManager people={people} onAdd={addPerson} onDelete={removePerson} />
         )}
       </main>
 
@@ -1138,15 +1231,21 @@ function Bar({ value, tone = "ader" }: { value: number; tone?: "ader" | "conf" }
 
 function NewRecordForm({
   mills,
+  people,
   onAdd,
+  onManagePeople,
 }: {
   mills: Mill[];
+  people: Person[];
   onAdd: (r: Record) => void;
+  onManagePeople: () => void;
 }) {
+  const limpezaPeople = people.filter((p) => p.limpeza);
+  const monitPeople = people.filter((p) => p.monitoramento);
   const [millId, setMillId] = useState(mills[0]?.id ?? "");
   const mill = mills.find((m) => m.id === millId) ?? mills[0];
-  const [date, setDate] = useState(todayISO);
-  const [shift, setShift] = useState<Shift>("A");
+  const [date, setDate] = useState(() => currentShift(new Date()).date);
+  const [shift, setShift] = useState<Shift>(() => currentShift(new Date()).shift);
   const [hour, setHour] = useState("");
   const [respLimpeza, setRespLimpeza] = useState("");
   const [respMonit, setRespMonit] = useState("");
@@ -1240,6 +1339,9 @@ function NewRecordForm({
                 }`}
               >
                 Turno {s}
+                <span className="block text-[10px] font-normal opacity-70">
+                  {SHIFT_TIMES[s].start}–{SHIFT_TIMES[s].end}
+                </span>
               </button>
             ))}
           </div>
@@ -1254,24 +1356,24 @@ function NewRecordForm({
           />
         </Field>
         <Field label="Responsável pela limpeza">
-          <input
-            value={respLimpeza}
-            onChange={(e) => setRespLimpeza(e.target.value)}
-            required
-            placeholder="Nome"
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
+          <PersonSelect value={respLimpeza} onChange={setRespLimpeza} people={limpezaPeople} />
         </Field>
         <Field label="Responsável pelo monitoramento">
-          <input
-            value={respMonit}
-            onChange={(e) => setRespMonit(e.target.value)}
-            required
-            placeholder="Nome"
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
+          <PersonSelect value={respMonit} onChange={setRespMonit} people={monitPeople} />
         </Field>
       </div>
+      {(limpezaPeople.length === 0 || monitPeople.length === 0) && (
+        <p className="text-xs text-muted-foreground">
+          Falta cadastrar responsáveis de{" "}
+          {[limpezaPeople.length === 0 && "limpeza", monitPeople.length === 0 && "monitoramento"]
+            .filter(Boolean)
+            .join(" e ")}
+          .{" "}
+          <button type="button" onClick={onManagePeople} className="underline hover:text-foreground">
+            Cadastrar responsáveis
+          </button>
+        </p>
+      )}
 
       <div>
         <div className="mb-2 flex items-center justify-between">
@@ -2050,6 +2152,7 @@ function LavagemTab({
   onCurrentMonth,
   mills,
   washes,
+  people,
   onAdd,
   onDelete,
 }: {
@@ -2061,6 +2164,7 @@ function LavagemTab({
   onCurrentMonth: () => void;
   mills: Mill[];
   washes: Wash[];
+  people: Person[];
   onAdd: (w: Wash) => void;
   onDelete: (id: string) => void;
 }) {
@@ -2206,7 +2310,7 @@ function LavagemTab({
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
-        <NewWashForm mills={mills} onAdd={onAdd} />
+        <NewWashForm mills={mills} people={people} onAdd={onAdd} />
       </div>
 
       <div className="overflow-x-auto rounded-xl border border-border bg-card">
@@ -2317,7 +2421,16 @@ function LavagemTab({
   );
 }
 
-function NewWashForm({ mills, onAdd }: { mills: Mill[]; onAdd: (w: Wash) => void }) {
+function NewWashForm({
+  mills,
+  people,
+  onAdd,
+}: {
+  mills: Mill[];
+  people: Person[];
+  onAdd: (w: Wash) => void;
+}) {
+  const limpezaPeople = people.filter((p) => p.limpeza);
   const [millId, setMillId] = useState(mills[0]?.id ?? "");
   const [date, setDate] = useState(todayISO);
   const [hour, setHour] = useState("");
@@ -2390,13 +2503,7 @@ function NewWashForm({ mills, onAdd }: { mills: Mill[]; onAdd: (w: Wash) => void
           />
         </Field>
         <Field label="Responsável">
-          <input
-            value={responsavel}
-            onChange={(e) => setResponsavel(e.target.value)}
-            required
-            placeholder="Nome"
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
+          <PersonSelect value={responsavel} onChange={setResponsavel} people={limpezaPeople} />
         </Field>
       </div>
       <Field label="Observação (opcional)">
@@ -2421,5 +2528,295 @@ function NewWashForm({ mills, onAdd }: { mills: Mill[]; onAdd: (w: Wash) => void
         {saved && <span className="text-sm text-success">✓ Lavagem salva</span>}
       </div>
     </form>
+  );
+}
+
+function PersonSelect({
+  value,
+  onChange,
+  people,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  people: Person[];
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      required
+      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+    >
+      <option value="" disabled>
+        {people.length === 0 ? "Nenhum responsável cadastrado" : "Selecione…"}
+      </option>
+      {people.map((p) => (
+        <option key={p.id} value={p.name}>
+          {p.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function PeopleManager({
+  people,
+  onAdd,
+  onDelete,
+}: {
+  people: Person[];
+  onAdd: (p: Omit<Person, "id">) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [limpeza, setLimpeza] = useState(true);
+  const [monitoramento, setMonitoramento] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    if (!limpeza && !monitoramento) {
+      setError("Selecione ao menos uma função.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await onAdd({ name: name.trim(), limpeza, monitoramento });
+      setName("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Não foi possível cadastrar.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (id: string) => {
+    setDeletingId(id);
+    try {
+      await onDelete(id);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const roleToggle = (on: boolean, set: (v: boolean) => void, label: string) => (
+    <button
+      type="button"
+      onClick={() => set(!on)}
+      className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition ${
+        on
+          ? "border-primary bg-primary text-primary-foreground"
+          : "border-input bg-background text-muted-foreground hover:bg-muted"
+      }`}
+    >
+      {on ? "✓ " : ""}
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <form
+        onSubmit={submit}
+        className="space-y-4 rounded-xl border border-border bg-card p-6 shadow-sm"
+      >
+        <div>
+          <h2 className="text-lg font-semibold">Cadastrar responsável</h2>
+          <p className="text-sm text-muted-foreground">
+            Os nomes cadastrados aparecem para seleção nos registros de limpeza e lavagem.
+          </p>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <Field label="Nome">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              placeholder="Nome completo"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </Field>
+          <Field label="Função">
+            <div className="flex gap-2">
+              {roleToggle(limpeza, setLimpeza, "Limpeza")}
+              {roleToggle(monitoramento, setMonitoramento, "Monitoramento")}
+            </div>
+          </Field>
+        </div>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <button
+          type="submit"
+          disabled={saving}
+          className="rounded-md bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow hover:opacity-90 disabled:opacity-60"
+        >
+          {saving ? "Salvando…" : "Cadastrar responsável"}
+        </button>
+      </form>
+
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold">Responsáveis cadastrados ({people.length})</h3>
+        </div>
+        {people.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted-foreground">
+            Nenhum responsável cadastrado.
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {people.map((p) => (
+              <li key={p.id} className="flex items-center justify-between gap-3 px-4 py-3">
+                <div>
+                  <p className="text-sm font-medium">{p.name}</p>
+                  <div className="mt-1 flex gap-1.5">
+                    {p.limpeza && (
+                      <span className="rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-semibold text-success">
+                        Limpeza
+                      </span>
+                    )}
+                    {p.monitoramento && (
+                      <span className="rounded-full bg-accent/40 px-2 py-0.5 text-[10px] font-semibold text-accent-foreground">
+                        Monitoramento
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={() => remove(p.id)}
+                  disabled={deletingId === p.id}
+                  className="rounded-md border border-input px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:border-destructive hover:text-destructive disabled:opacity-60"
+                >
+                  {deletingId === p.id ? "Excluindo…" : "Excluir"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+          Excluir um responsável não altera os registros já feitos.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// Alerta de turnos sem registro de limpeza: últimos 3 turnos encerrados (24h) + turno atual.
+function ShiftAlerts({
+  records,
+  mills,
+  onRegister,
+  onPendencias,
+}: {
+  records: Record[];
+  mills: Mill[];
+  onRegister: () => void;
+  onPendencias: () => void;
+}) {
+  // Só no cliente: a hora do servidor pode diferir e quebrar a hidratação.
+  const [now, setNow] = useState<Date | null>(null);
+  const [open, setOpen] = useState(true);
+  useEffect(() => {
+    setNow(new Date());
+    const id = setInterval(() => setNow(new Date()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!now || mills.length === 0) return null;
+
+  const done = new Set(records.map((r) => `${r.date}|${r.shift}|${r.millId}`));
+  const missingFor = (date: string, shift: Shift) =>
+    mills.filter((m) => !done.has(`${date}|${shift}|${m.id}`));
+
+  const current = currentShift(now);
+  const currentMissing = missingFor(current.date, current.shift);
+  const minutesLeft = Math.round((shiftEnd(current.date, current.shift).getTime() - now.getTime()) / 60000);
+
+  const closed: { date: string; shift: Shift; missing: Mill[] }[] = [];
+  let cursor = current;
+  for (let i = 0; i < 3; i++) {
+    cursor = previousShift(cursor);
+    closed.push({ ...cursor, missing: missingFor(cursor.date, cursor.shift) });
+  }
+  const closedWithMissing = closed.filter((c) => c.missing.length > 0);
+  const totalMissing = closedWithMissing.reduce((a, c) => a + c.missing.length, 0);
+  const endingSoon = currentMissing.length > 0 && minutesLeft <= 60;
+
+  const label = (date: string, shift: Shift) =>
+    shift === "C"
+      ? `Turno C de ${formatBR(date)} (${formatBR(shiftDay(date, -1)).slice(0, 5)} 22:40–06:00)`
+      : `Turno ${shift} de ${formatBR(date)} (${SHIFT_TIMES[shift].start}–${SHIFT_TIMES[shift].end})`;
+  const names = (ms: Mill[]) => ms.map((m) => m.name).join(", ");
+
+  if (totalMissing === 0 && currentMissing.length === 0) {
+    return (
+      <div className="mb-6 rounded-xl border border-success/30 bg-success/10 px-4 py-2 text-sm text-success">
+        ✓ Registros em dia — inclusive o {label(current.date, current.shift)}.
+      </div>
+    );
+  }
+
+  const tone =
+    totalMissing > 0
+      ? "border-destructive/40 bg-destructive/10"
+      : endingSoon
+        ? "border-accent bg-accent/30"
+        : "border-border bg-card";
+
+  return (
+    <div className={`mb-6 rounded-xl border px-4 py-3 text-sm ${tone}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-semibold">
+          {totalMissing > 0
+            ? `⚠ ${totalMissing} registro(s) de limpeza faltando nos últimos turnos`
+            : endingSoon
+              ? `⏰ Turno ${current.shift} termina em ${minutesLeft} min — faltam ${currentMissing.length} registro(s)`
+              : `Turno ${current.shift} em andamento — ${currentMissing.length} registro(s) a fazer`}
+        </p>
+        <div className="flex gap-2 text-xs">
+          <button
+            onClick={onRegister}
+            className="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90"
+          >
+            Registrar
+          </button>
+          {totalMissing > 0 && (
+            <button
+              onClick={onPendencias}
+              className="rounded-md border border-input bg-card px-3 py-1.5 font-medium hover:bg-muted"
+            >
+              Pendências
+            </button>
+          )}
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="rounded-md px-2 py-1.5 text-muted-foreground hover:text-foreground"
+          >
+            {open ? "Ocultar" : "Detalhes"}
+          </button>
+        </div>
+      </div>
+      {open && (
+        <ul className="mt-2 space-y-1">
+          {closedWithMissing.map((c) => (
+            <li key={`${c.date}|${c.shift}`} className="text-destructive">
+              <strong>{label(c.date, c.shift)}</strong> — encerrado sem registro: {names(c.missing)}
+            </li>
+          ))}
+          {currentMissing.length > 0 && (
+            <li className={endingSoon ? "font-medium" : "text-muted-foreground"}>
+              <strong>{label(current.date, current.shift)}</strong> — em andamento, faltam:{" "}
+              {names(currentMissing)} (termina em{" "}
+              {minutesLeft >= 60
+                ? `${Math.floor(minutesLeft / 60)}h${String(minutesLeft % 60).padStart(2, "0")}`
+                : `${minutesLeft} min`}
+              )
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
   );
 }
