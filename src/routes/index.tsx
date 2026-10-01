@@ -13,6 +13,11 @@ import {
   deleteMill as deleteMillServerFn,
 } from "@/server/mills";
 import {
+  getWashes,
+  addWash as addWashServerFn,
+  deleteWash as deleteWashServerFn,
+} from "@/server/washes";
+import {
   Bar as RBar,
   BarChart,
   CartesianGrid,
@@ -33,8 +38,12 @@ import autoTable from "jspdf-autotable";
 
 export const Route = createFileRoute("/")({
   loader: async () => {
-    const [records, mills] = await Promise.all([getRecords(), getMills()]);
-    return { records, mills };
+    const [records, mills, washes] = await Promise.all([
+      getRecords(),
+      getMills(),
+      getWashes(),
+    ]);
+    return { records, mills, washes };
   },
   component: Index,
 });
@@ -57,8 +66,35 @@ type Record = {
   createdAt: string;
 };
 
+type Wash = {
+  id: string;
+  millId: string;
+  date: string; // YYYY-MM-DD
+  hour: string; // HH:MM
+  responsavel: string;
+  observacao: string;
+  createdAt: string;
+};
+
+// Data local (evita virar o dia antes da meia-noite por causa do UTC)
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function monthStartISO() {
+  return todayISO().slice(0, 8) + "01";
+}
+
+function addDaysISO(iso: string, n: number) {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function weekdayISO(iso: string) {
+  return new Date(iso + "T00:00:00Z").getUTCDay(); // 0 = domingo
 }
 
 function daysBetween(a: string, b: string) {
@@ -68,23 +104,32 @@ function daysBetween(a: string, b: string) {
 }
 
 function Index() {
-  const { records: initialRecords, mills: initialMills } = Route.useLoaderData();
+  const {
+    records: initialRecords,
+    mills: initialMills,
+    washes: initialWashes,
+  } = Route.useLoaderData();
   const [records, setRecords] = useState<Record[]>(initialRecords);
   const [mills, setMills] = useState<Mill[]>(initialMills);
+  const [washes, setWashes] = useState<Wash[]>(initialWashes);
 
   const addRecordFn = useServerFn(addRecordServerFn);
   const deleteRecordFn = useServerFn(deleteRecordServerFn);
   const addMillFn = useServerFn(addMillServerFn);
   const deleteMillFn = useServerFn(deleteMillServerFn);
+  const addWashFn = useServerFn(addWashServerFn);
+  const deleteWashFn = useServerFn(deleteWashServerFn);
 
-  const [from, setFrom] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 6);
-    return d.toISOString().slice(0, 10);
-  });
+  // Padrão: mês atual (do dia 1 até hoje). Outras datas pelo filtro.
+  const [from, setFrom] = useState(monthStartISO);
   const [to, setTo] = useState(todayISO);
+  const setCurrentMonth = () => {
+    setFrom(monthStartISO());
+    setTo(todayISO());
+  };
+  const isCurrentMonth = from === monthStartISO() && to === todayISO();
   const [tab, setTab] = useState<
-    "dashboard" | "novo" | "historico" | "pendencias" | "moinhos"
+    "dashboard" | "novo" | "historico" | "pendencias" | "lavagem" | "moinhos"
   >("dashboard");
 
   const [millFilter, setMillFilter] = useState<string[]>(() =>
@@ -151,9 +196,7 @@ function Index() {
   const perDate = useMemo(() => {
     const map = new Map<string, { date: string; feitos: number; conformes: number }>();
     for (let i = 0; i < totalDias; i++) {
-      const d = new Date(from + "T00:00:00");
-      d.setDate(d.getDate() + i);
-      const iso = d.toISOString().slice(0, 10);
+      const iso = addDaysISO(from, i);
       map.set(iso, { date: iso, feitos: 0, conformes: 0 });
     }
     for (const r of filtered) {
@@ -202,9 +245,7 @@ function Index() {
     );
     const list: { date: string; shift: Shift; mill: Mill }[] = [];
     for (let i = 0; i < totalDias; i++) {
-      const d = new Date(from + "T00:00:00");
-      d.setDate(d.getDate() + i);
-      const iso = d.toISOString().slice(0, 10);
+      const iso = addDaysISO(from, i);
       for (const s of activeShifts) {
         for (const m of activeMills) {
           if (!done.has(`${iso}|${s}|${m.id}`)) {
@@ -271,11 +312,30 @@ function Index() {
     const created = await addMillFn({ data: m });
     setMills((prev) => [...prev, created]);
   };
+  const addWash = (w: Wash) => {
+    setWashes((prev) => [w, ...prev]);
+    addWashFn({ data: w }).catch((err) => {
+      console.error(err);
+      setWashes((prev) => prev.filter((x) => x.id !== w.id));
+    });
+  };
+  const removeWash = (id: string) => {
+    setWashes((prev) => prev.filter((w) => w.id !== id));
+    deleteWashFn({ data: { id } }).catch((err) => console.error(err));
+  };
+
   const removeMill = async (id: string) => {
     await deleteMillFn({ data: { id } });
     setMills((prev) => prev.filter((m) => m.id !== id));
     setMillFilter((prev) => prev.filter((x) => x !== id));
   };
+
+  const lavagem = summarizeWashes(
+    activeMills,
+    washes.filter((w) => millFilter.includes(w.millId)),
+    from,
+    to,
+  );
 
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
@@ -328,6 +388,53 @@ function Index() {
       wb,
       XLSX.utils.json_to_sheet(perDate),
       "Por Data",
+    );
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        lavagem.perMill.map((p) => ({
+          Moinho: p.mill.name,
+          Area: p.mill.area,
+          "Última lavagem": p.last ? formatBR(p.last.date) : "",
+          "Próxima (prazo)": p.proxima ? formatBR(p.proxima) : "",
+          Vencimentos: p.cycles.length,
+          "No prazo": p.noPrazo,
+          Atrasadas: p.atrasadas,
+          "Não realizadas": p.naoRealizadas,
+          "Aderência %": p.aderencia === null ? "" : +p.aderencia.toFixed(1),
+        })),
+      ),
+      "Lavagem - Moinho",
+    );
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        lavagem.allCycles.map((c) => ({
+          Vencimento: formatBR(c.due),
+          Moinho: mills.find((m) => m.id === c.millId)?.name,
+          "Realizada em": c.wash ? formatBR(c.wash.date) : "",
+          Status: WASH_STATUS_LABEL[c.status],
+          "Dias de atraso": c.diasAtraso,
+        })),
+      ),
+      "Lavagem - Vencimentos",
+    );
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        lavagem.lavagensPeriodo.map((w) => {
+          const m = mills.find((x) => x.id === w.millId);
+          return {
+            Data: formatBR(w.date),
+            Hora: w.hour,
+            Area: m?.area,
+            Moinho: m?.name,
+            Responsável: w.responsavel,
+            Observação: w.observacao,
+          };
+        }),
+      ),
+      "Lavagem - Registros",
     );
     XLSX.writeFile(wb, `aderencia_limpeza_${from}_a_${to}.xlsx`);
   };
@@ -442,13 +549,83 @@ function Index() {
         }
       },
     });
+    y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+    autoTable(doc, {
+      startY: y,
+      head: [["Lavagem das mangas", "Valor"]],
+      body: [
+        ["Regra", `1x a cada ${WASH_INTERVAL_DAYS} dias por moinho (domingo → segunda)`],
+        ["Aderência à lavagem", `${lavagem.aderenciaGeral.toFixed(1)}%`],
+        ["No prazo", `${lavagem.totalNoPrazo} de ${lavagem.allCycles.length}`],
+        ["Atrasadas", `${lavagem.totalAtrasadas}`],
+        ["Não realizadas", `${lavagem.totalNaoRealizadas}`],
+      ],
+      styles: { fontSize: 9 },
+      headStyles: { fillColor: [30, 90, 50] },
+    });
+    y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+    autoTable(doc, {
+      startY: y,
+      head: [["Moinho", "Área", "Última lavagem", "Próxima (prazo)", "Vencimentos", "No prazo", "Atrasadas", "Não realizadas", "Aderência %"]],
+      body: lavagem.perMill.map((p) => [
+        p.mill.name,
+        p.mill.area,
+        p.last ? formatBR(p.last.date) : "—",
+        p.proxima ? formatBR(p.proxima) : "—",
+        p.cycles.length,
+        p.noPrazo,
+        p.atrasadas,
+        p.naoRealizadas,
+        p.aderencia === null ? "—" : p.aderencia.toFixed(1),
+      ]),
+      styles: { fontSize: 9 },
+      headStyles: { fillColor: [30, 90, 50] },
+    });
+    y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+    autoTable(doc, {
+      startY: y,
+      head: [["Vencimento", "Moinho", "Realizada em", "Status", "Dias de atraso"]],
+      body: [...lavagem.allCycles]
+        .sort((a, b) => b.due.localeCompare(a.due))
+        .map((c) => [
+          formatBR(c.due),
+          mills.find((m) => m.id === c.millId)?.name ?? "",
+          c.wash ? formatBR(c.wash.date) : "—",
+          WASH_STATUS_LABEL[c.status],
+          c.diasAtraso,
+        ]),
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [30, 90, 50] },
+      didParseCell: (data) => {
+        if (data.section === "body" && data.column.index === 3) {
+          data.cell.styles.textColor =
+            data.cell.raw === "No prazo"
+              ? [30, 120, 60]
+              : data.cell.raw === "Atrasada"
+                ? [170, 110, 0]
+                : [180, 40, 40];
+          data.cell.styles.fontStyle = "bold";
+        }
+      },
+    });
+    y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+    autoTable(doc, {
+      startY: y,
+      head: [["Data", "Hora", "Moinho", "Área", "Responsável", "Observação"]],
+      body: lavagem.lavagensPeriodo.map((w) => {
+        const m = mills.find((x) => x.id === w.millId);
+        return [formatBR(w.date), w.hour, m?.name ?? "", m?.area ?? "", w.responsavel, w.observacao];
+      }),
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [30, 90, 50] },
+    });
     doc.save(`aderencia_limpeza_${from}_a_${to}.pdf`);
   };
 
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border bg-primary text-primary-foreground">
-        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-6 sm:py-4">
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 sm:px-6 sm:py-4 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
           <div className="flex items-center gap-3">
             <div className="shrink-0 rounded-md bg-white/95 px-3 py-2">
               <img src={logo} alt="Nutrimilho" className="h-8 w-auto shrink-0" />
@@ -462,20 +639,21 @@ function Index() {
               </p>
             </div>
           </div>
-          <nav className="flex gap-1 rounded-lg bg-white/10 p-1 text-sm">
+          <nav className="flex gap-1 overflow-x-auto rounded-lg bg-white/10 p-1 text-sm">
             {(
               [
                 ["dashboard", "Indicador"],
                 ["novo", "Registrar"],
                 ["historico", "Histórico"],
                 ["pendencias", "Pendências"],
+                ["lavagem", "Lavagem"],
                 ["moinhos", "Moinhos"],
               ] as const
             ).map(([k, l]) => (
               <button
                 key={k}
                 onClick={() => setTab(k)}
-                className={`flex-1 rounded-md px-3 py-1.5 transition sm:flex-initial ${
+                className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 transition lg:flex-initial ${
                   tab === k
                     ? "bg-white text-primary shadow"
                     : "text-primary-foreground/90 hover:bg-white/10"
@@ -492,24 +670,14 @@ function Index() {
         {tab === "dashboard" && (
           <section className="space-y-6">
             <div className="flex flex-wrap items-end gap-3">
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground">De</label>
-                <input
-                  type="date"
-                  value={from}
-                  onChange={(e) => setFrom(e.target.value)}
-                  className="mt-1 rounded-md border border-input bg-card px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground">Até</label>
-                <input
-                  type="date"
-                  value={to}
-                  onChange={(e) => setTo(e.target.value)}
-                  className="mt-1 rounded-md border border-input bg-card px-3 py-2 text-sm"
-                />
-              </div>
+              <PeriodFilter
+                from={from}
+                to={to}
+                setFrom={setFrom}
+                setTo={setTo}
+                isCurrentMonth={isCurrentMonth}
+                onCurrentMonth={setCurrentMonth}
+              />
               <p className="ml-auto text-xs text-muted-foreground">
                 Esperado: {activeShifts.length} turno(s)/dia × {activeMills.length} moinho(s) ={" "}
                 <strong>{esperadoTotal}</strong> registros
@@ -857,6 +1025,21 @@ function Index() {
             porTurno={pendenciasPorTurno}
             porMoinho={pendenciasPorMoinho}
             porDia={pendenciasPorDia}
+          />
+        )}
+
+        {tab === "lavagem" && (
+          <LavagemTab
+            from={from}
+            to={to}
+            setFrom={setFrom}
+            setTo={setTo}
+            isCurrentMonth={isCurrentMonth}
+            onCurrentMonth={setCurrentMonth}
+            mills={mills}
+            washes={washes}
+            onAdd={addWash}
+            onDelete={removeWash}
           />
         )}
 
@@ -1668,5 +1851,570 @@ function MillsManager({
         )}
       </div>
     </div>
+  );
+}
+
+function PeriodFilter({
+  from,
+  to,
+  setFrom,
+  setTo,
+  isCurrentMonth,
+  onCurrentMonth,
+}: {
+  from: string;
+  to: string;
+  setFrom: (v: string) => void;
+  setTo: (v: string) => void;
+  isCurrentMonth: boolean;
+  onCurrentMonth: () => void;
+}) {
+  return (
+    <>
+      <div>
+        <label className="block text-xs font-medium text-muted-foreground">De</label>
+        <input
+          type="date"
+          value={from}
+          onChange={(e) => setFrom(e.target.value)}
+          className="mt-1 rounded-md border border-input bg-card px-3 py-2 text-sm"
+        />
+      </div>
+      <div>
+        <label className="block text-xs font-medium text-muted-foreground">Até</label>
+        <input
+          type="date"
+          value={to}
+          onChange={(e) => setTo(e.target.value)}
+          className="mt-1 rounded-md border border-input bg-card px-3 py-2 text-sm"
+        />
+      </div>
+      <button
+        type="button"
+        onClick={onCurrentMonth}
+        disabled={isCurrentMonth}
+        className="rounded-md border border-input bg-card px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+        title="Voltar para o mês atual (dia 1 até hoje)"
+      >
+        Mês atual
+      </button>
+    </>
+  );
+}
+
+// Lavagem das mangas: 1x a cada 10 dias por moinho, independente de turno.
+// Escala 6x1 com folga aos domingos: prazo que cai no domingo vai para segunda.
+const WASH_INTERVAL_DAYS = 10;
+
+function washDeadline(iso: string) {
+  return weekdayISO(iso) === 0 ? addDaysISO(iso, 1) : iso;
+}
+
+type WashCycle = {
+  millId: string;
+  due: string;
+  status: "no_prazo" | "atrasada" | "nao_realizada";
+  wash?: Wash;
+  diasAtraso: number;
+};
+
+function daysDiff(a: string, b: string) {
+  return Math.round(
+    (new Date(b + "T00:00:00Z").getTime() - new Date(a + "T00:00:00Z").getTime()) /
+      86400000,
+  );
+}
+
+// Ciclos com vencimento dentro de [from, to]. Cada lavagem reinicia a contagem.
+// Ciclos ainda em aberto (vencimento a partir de hoje e sem lavagem) não entram.
+function computeWashCycles(
+  millId: string,
+  millWashes: Wash[],
+  from: string,
+  to: string,
+  today: string,
+): WashCycle[] {
+  const sorted = [...millWashes].sort((a, b) => a.date.localeCompare(b.date));
+  const prev = [...sorted].reverse().find((w) => w.date < from);
+  // Sem lavagem anterior: o primeiro ciclo são os primeiros 10 dias do período.
+  let start = prev ? prev.date : addDaysISO(from, -1);
+  let i = sorted.findIndex((w) => w.date > start);
+  if (i < 0) i = sorted.length;
+  const cycles: WashCycle[] = [];
+  for (let guard = 0; guard < 1000; guard++) {
+    const due = washDeadline(addDaysISO(start, WASH_INTERVAL_DAYS));
+    if (due > to) break;
+    const w = sorted[i];
+    const nextDue = washDeadline(addDaysISO(due, WASH_INTERVAL_DAYS));
+    let cycle: WashCycle;
+    if (w && w.date <= due) {
+      cycle = { millId, due, status: "no_prazo", wash: w, diasAtraso: 0 };
+      start = w.date;
+      i++;
+    } else if (w && w.date <= nextDue) {
+      cycle = { millId, due, status: "atrasada", wash: w, diasAtraso: daysDiff(due, w.date) };
+      start = w.date;
+      i++;
+    } else if (due < today) {
+      cycle = { millId, due, status: "nao_realizada", diasAtraso: daysDiff(due, today) };
+      start = due;
+    } else {
+      break; // ciclo em aberto, ainda dentro do prazo
+    }
+    if (due >= from) cycles.push(cycle);
+  }
+  return cycles;
+}
+
+const WASH_STATUS_LABEL: { [K in WashCycle["status"]]: string } = {
+  no_prazo: "No prazo",
+  atrasada: "Atrasada",
+  nao_realizada: "Não realizada",
+};
+
+function formatBR(iso: string) {
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function summarizeWashes(mills: Mill[], washes: Wash[], from: string, to: string) {
+  const today = todayISO();
+
+  const perMill = mills.map((m) => {
+    const millWashes = washes.filter((w) => w.millId === m.id);
+    const cycles = computeWashCycles(m.id, millWashes, from, to, today);
+    const noPrazo = cycles.filter((c) => c.status === "no_prazo").length;
+    const atrasadas = cycles.filter((c) => c.status === "atrasada").length;
+    const naoRealizadas = cycles.filter((c) => c.status === "nao_realizada").length;
+    const aderencia = cycles.length ? (noPrazo / cycles.length) * 100 : null;
+    const last = millWashes.reduce<Wash | undefined>(
+      (acc, w) => (!acc || w.date > acc.date ? w : acc),
+      undefined,
+    );
+    const proxima = last ? washDeadline(addDaysISO(last.date, WASH_INTERVAL_DAYS)) : null;
+    const diasParaProxima = proxima ? daysDiff(today, proxima) : null;
+    return {
+      mill: m,
+      cycles,
+      noPrazo,
+      atrasadas,
+      naoRealizadas,
+      aderencia,
+      last,
+      proxima,
+      diasParaProxima,
+    };
+  });
+
+  const allCycles = perMill.flatMap((p) => p.cycles);
+  const totalNoPrazo = perMill.reduce((a, p) => a + p.noPrazo, 0);
+  const totalAtrasadas = perMill.reduce((a, p) => a + p.atrasadas, 0);
+  const totalNaoRealizadas = perMill.reduce((a, p) => a + p.naoRealizadas, 0);
+  const aderenciaGeral = allCycles.length ? (totalNoPrazo / allCycles.length) * 100 : 0;
+  const vencidos = perMill.filter(
+    (p) => p.diasParaProxima === null || p.diasParaProxima < 0,
+  ).length;
+
+  const lavagensPeriodo = washes
+    .filter((w) => w.date >= from && w.date <= to)
+    .sort((a, b) => (b.date + b.hour).localeCompare(a.date + a.hour));
+
+  return {
+    perMill,
+    allCycles,
+    totalNoPrazo,
+    totalAtrasadas,
+    totalNaoRealizadas,
+    aderenciaGeral,
+    vencidos,
+    lavagensPeriodo,
+  };
+}
+
+const WEEKDAYS = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+
+function LavagemTab({
+  from,
+  to,
+  setFrom,
+  setTo,
+  isCurrentMonth,
+  onCurrentMonth,
+  mills,
+  washes,
+  onAdd,
+  onDelete,
+}: {
+  from: string;
+  to: string;
+  setFrom: (v: string) => void;
+  setTo: (v: string) => void;
+  isCurrentMonth: boolean;
+  onCurrentMonth: () => void;
+  mills: Mill[];
+  washes: Wash[];
+  onAdd: (w: Wash) => void;
+  onDelete: (id: string) => void;
+}) {
+  const {
+    perMill,
+    allCycles,
+    totalNoPrazo,
+    totalAtrasadas,
+    totalNaoRealizadas,
+    aderenciaGeral,
+    vencidos,
+    lavagensPeriodo,
+  } = summarizeWashes(mills, washes, from, to);
+
+  const chartData = perMill.map((p) => ({
+    moinho: p.mill.name,
+    aderencia: p.aderencia === null ? 0 : +p.aderencia.toFixed(1),
+  }));
+
+  return (
+    <section className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold">Lavagem das mangas</h2>
+        <p className="text-sm text-muted-foreground">
+          1 lavagem a cada {WASH_INTERVAL_DAYS} dias por moinho, independente de turno.
+          Escala 6x1 com folga aos domingos: prazo que cai no domingo passa para segunda.
+          A contagem reinicia a partir da data da última lavagem.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-end gap-3">
+        <PeriodFilter
+          from={from}
+          to={to}
+          setFrom={setFrom}
+          setTo={setTo}
+          isCurrentMonth={isCurrentMonth}
+          onCurrentMonth={onCurrentMonth}
+        />
+        <p className="ml-auto text-xs text-muted-foreground">
+          {allCycles.length} lavagem(ns) com vencimento no período
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-4">
+        <KpiCard
+          title="Aderência à Lavagem"
+          value={`${aderenciaGeral.toFixed(1)}%`}
+          sub={`${totalNoPrazo} de ${allCycles.length} no prazo`}
+          tone={aderenciaGeral >= 90 ? "good" : aderenciaGeral >= 70 ? "warn" : "bad"}
+        />
+        <KpiCard
+          title="Atrasadas"
+          value={`${totalAtrasadas}`}
+          sub="feitas após o vencimento"
+          tone={totalAtrasadas === 0 ? "good" : "warn"}
+        />
+        <KpiCard
+          title="Não realizadas"
+          value={`${totalNaoRealizadas}`}
+          sub="vencidas sem lavagem"
+          tone={totalNaoRealizadas === 0 ? "good" : "bad"}
+        />
+        <KpiCard
+          title="Moinhos vencidos hoje"
+          value={`${vencidos}`}
+          sub={`de ${mills.length} moinho(s)`}
+          tone={vencidos === 0 ? "good" : "bad"}
+        />
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <table className="w-full text-sm">
+          <thead className="bg-secondary text-secondary-foreground">
+            <tr>
+              <th className="px-4 py-2 text-left">Moinho</th>
+              <th className="px-4 py-2 text-left">Última lavagem</th>
+              <th className="px-4 py-2 text-left">Próxima (prazo)</th>
+              <th className="px-4 py-2 text-center">No prazo / Vencidas</th>
+              <th className="px-4 py-2 text-left">Aderência</th>
+            </tr>
+          </thead>
+          <tbody>
+            {perMill.map((p) => {
+              const d = p.diasParaProxima;
+              const badge =
+                d === null
+                  ? { text: "Sem registro", cls: "bg-destructive/15 text-destructive" }
+                  : d < 0
+                    ? { text: `Atrasada ${-d} dia(s)`, cls: "bg-destructive/15 text-destructive" }
+                    : d === 0
+                      ? { text: "Vence hoje", cls: "bg-accent/40 text-accent-foreground" }
+                      : d <= 2
+                        ? { text: `Vence em ${d} dia(s)`, cls: "bg-accent/40 text-accent-foreground" }
+                        : { text: `Em dia (${d} dias)`, cls: "bg-success/15 text-success" };
+              return (
+                <tr key={p.mill.id} className="border-t border-border">
+                  <td className="px-4 py-3">
+                    <div className="font-medium">{p.mill.name}</div>
+                    <div className="text-xs text-muted-foreground">{p.mill.area}</div>
+                  </td>
+                  <td className="px-4 py-3">{p.last ? formatBR(p.last.date) : "—"}</td>
+                  <td className="px-4 py-3">
+                    {p.proxima && (
+                      <div>
+                        {formatBR(p.proxima)}{" "}
+                        <span className="text-xs text-muted-foreground">
+                          ({WEEKDAYS[weekdayISO(p.proxima)]})
+                        </span>
+                      </div>
+                    )}
+                    <span
+                      className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${badge.cls}`}
+                    >
+                      {badge.text}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    {p.noPrazo} / {p.cycles.length}
+                  </td>
+                  <td className="px-4 py-3">
+                    {p.aderencia === null ? (
+                      <span className="text-xs text-muted-foreground">
+                        Nenhum vencimento no período
+                      </span>
+                    ) : (
+                      <Bar value={p.aderencia} />
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <ChartCard title="Aderência à lavagem por moinho">
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={chartData} margin={{ top: 10, right: 16, bottom: 0, left: -10 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="hsl(0 0% 90%)" />
+              <XAxis dataKey="moinho" fontSize={11} />
+              <YAxis domain={[0, 100]} fontSize={11} unit="%" />
+              <Tooltip />
+              <RBar dataKey="aderencia" name="Aderência %" fill="oklch(0.38 0.13 145)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+        <NewWashForm mills={mills} onAdd={onAdd} />
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold">Vencimentos no período</h3>
+        </div>
+        <table className="w-full text-sm">
+          <thead className="bg-secondary text-secondary-foreground">
+            <tr>
+              <th className="px-4 py-2 text-left">Vencimento</th>
+              <th className="px-4 py-2 text-left">Moinho</th>
+              <th className="px-4 py-2 text-left">Realizada em</th>
+              <th className="px-4 py-2 text-left">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {allCycles.length === 0 ? (
+              <tr>
+                <td colSpan={4} className="px-4 py-10 text-center text-muted-foreground">
+                  Nenhuma lavagem com vencimento no período.
+                </td>
+              </tr>
+            ) : (
+              [...allCycles]
+                .sort((a, b) => b.due.localeCompare(a.due))
+                .map((c) => {
+                  const mill = mills.find((m) => m.id === c.millId);
+                  const cls =
+                    c.status === "no_prazo"
+                      ? "bg-success/15 text-success"
+                      : c.status === "atrasada"
+                        ? "bg-accent/40 text-accent-foreground"
+                        : "bg-destructive/15 text-destructive";
+                  return (
+                    <tr key={`${c.millId}|${c.due}`} className="border-t border-border">
+                      <td className="px-4 py-2">
+                        {formatBR(c.due)}{" "}
+                        <span className="text-xs text-muted-foreground">
+                          ({WEEKDAYS[weekdayISO(c.due)]})
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 font-medium">{mill?.name}</td>
+                      <td className="px-4 py-2">{c.wash ? formatBR(c.wash.date) : "—"}</td>
+                      <td className="px-4 py-2">
+                        <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${cls}`}>
+                          {WASH_STATUS_LABEL[c.status]}
+                          {c.diasAtraso > 0 && ` · ${c.diasAtraso} dia(s)`}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold">
+            Lavagens registradas no período ({lavagensPeriodo.length})
+          </h3>
+        </div>
+        {lavagensPeriodo.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted-foreground">
+            Nenhuma lavagem registrada no período.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-secondary text-secondary-foreground">
+              <tr>
+                <th className="px-4 py-2 text-left">Data</th>
+                <th className="px-4 py-2 text-left">Hora</th>
+                <th className="px-4 py-2 text-left">Moinho</th>
+                <th className="px-4 py-2 text-left">Responsável</th>
+                <th className="px-4 py-2 text-left">Observação</th>
+                <th className="px-4 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {lavagensPeriodo.map((w) => {
+                const mill = mills.find((m) => m.id === w.millId);
+                return (
+                  <tr key={w.id} className="border-t border-border">
+                    <td className="px-4 py-2">{formatBR(w.date)}</td>
+                    <td className="px-4 py-2">{w.hour}</td>
+                    <td className="px-4 py-2">
+                      {mill?.area} — {mill?.name}
+                    </td>
+                    <td className="px-4 py-2">{w.responsavel}</td>
+                    <td className="px-4 py-2 text-muted-foreground">{w.observacao}</td>
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        onClick={() => onDelete(w.id)}
+                        className="text-xs text-muted-foreground hover:text-destructive"
+                      >
+                        Excluir
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function NewWashForm({ mills, onAdd }: { mills: Mill[]; onAdd: (w: Wash) => void }) {
+  const [millId, setMillId] = useState(mills[0]?.id ?? "");
+  const [date, setDate] = useState(todayISO);
+  const [hour, setHour] = useState("");
+  const [responsavel, setResponsavel] = useState("");
+  const [observacao, setObservacao] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const mill = mills.find((m) => m.id === millId) ?? mills[0];
+  const isSunday = weekdayISO(date) === 0;
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mill || !hour || !responsavel.trim()) return;
+    onAdd({
+      id: crypto.randomUUID(),
+      millId: mill.id,
+      date,
+      hour,
+      responsavel: responsavel.trim(),
+      observacao: observacao.trim(),
+      createdAt: new Date().toISOString(),
+    });
+    setHour("");
+    setResponsavel("");
+    setObservacao("");
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  if (!mill) {
+    return (
+      <div className="rounded-xl border border-dashed border-border bg-card p-10 text-center text-sm text-muted-foreground">
+        Nenhum moinho cadastrado.
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4">
+      <h3 className="text-sm font-semibold">Registrar lavagem</h3>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Moinho">
+          <select
+            value={mill.id}
+            onChange={(e) => setMillId(e.target.value)}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            {mills.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.area} — {m.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Data">
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+        <Field label="Hora">
+          <input
+            type="time"
+            value={hour}
+            onChange={(e) => setHour(e.target.value)}
+            required
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+        <Field label="Responsável">
+          <input
+            value={responsavel}
+            onChange={(e) => setResponsavel(e.target.value)}
+            required
+            placeholder="Nome"
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+      </div>
+      <Field label="Observação (opcional)">
+        <input
+          value={observacao}
+          onChange={(e) => setObservacao(e.target.value)}
+          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+        />
+      </Field>
+      {isSunday && (
+        <p className="text-xs text-accent-foreground">
+          Atenção: a data escolhida é um domingo (dia de folga na escala 6x1).
+        </p>
+      )}
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow hover:opacity-90"
+        >
+          Salvar lavagem
+        </button>
+        {saved && <span className="text-sm text-success">✓ Lavagem salva</span>}
+      </div>
+    </form>
   );
 }

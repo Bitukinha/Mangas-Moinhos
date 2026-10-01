@@ -76,6 +76,20 @@ export const deleteMill = createServerFn({ method: "POST" })
         "Este moinho possui registros de limpeza e não pode ser excluído.",
       );
     }
+    const [{ washes }] = await sql()`
+      select count(*)::int as washes from information_schema.tables
+      where table_name = 'washes'
+    `;
+    if (washes > 0) {
+      const [{ count: washCount }] = await sql()`
+        select count(*)::int as count from washes where mill_id = ${data.id}
+      `;
+      if (washCount > 0) {
+        throw new Error(
+          "Este moinho possui registros de lavagem e não pode ser excluído.",
+        );
+      }
+    }
     await sql()`delete from mills where id = ${data.id}`;
     return { id: data.id };
   });
