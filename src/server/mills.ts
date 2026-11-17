@@ -90,6 +90,20 @@ export const deleteMill = createServerFn({ method: "POST" })
         );
       }
     }
+    const [{ trocas }] = await sql()`
+      select count(*)::int as trocas from information_schema.tables
+      where table_name = 'exchanges'
+    `;
+    if (trocas > 0) {
+      const [{ count: exCount }] = await sql()`
+        select count(*)::int as count from exchanges where mill_id = ${data.id}
+      `;
+      if (exCount > 0) {
+        throw new Error(
+          "Este moinho possui trocas de mangas registradas e não pode ser excluído.",
+        );
+      }
+    }
     await sql()`delete from mills where id = ${data.id}`;
     return { id: data.id };
   });

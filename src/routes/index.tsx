@@ -24,6 +24,16 @@ import {
   deletePerson as deletePersonServerFn,
 } from "@/server/people";
 import {
+  getDowntimes,
+  addDowntime as addDowntimeServerFn,
+  deleteDowntime as deleteDowntimeServerFn,
+} from "@/server/downtimes";
+import {
+  getExchanges,
+  addExchange as addExchangeServerFn,
+  deleteExchange as deleteExchangeServerFn,
+} from "@/server/exchanges";
+import {
   Bar as RBar,
   BarChart,
   CartesianGrid,
@@ -44,13 +54,15 @@ import autoTable from "jspdf-autotable";
 
 export const Route = createFileRoute("/")({
   loader: async () => {
-    const [records, mills, washes, people] = await Promise.all([
+    const [records, mills, washes, people, downtimes, exchanges] = await Promise.all([
       getRecords(),
       getMills(),
       getWashes(),
       getPeople(),
+      getDowntimes(),
+      getExchanges(),
     ]);
-    return { records, mills, washes, people };
+    return { records, mills, washes, people, downtimes, exchanges };
   },
   component: Index,
 });
@@ -129,6 +141,41 @@ type Wash = {
   createdAt: string;
 };
 
+// Moinho parado (ou todos, com millId "") em um intervalo de dias e turnos:
+// não gera pendência e não entra no esperado da aderência.
+type Downtime = {
+  id: string;
+  millId: string; // "" = todos os moinhos
+  dateFrom: string;
+  dateTo: string;
+  shifts: Shift[];
+  motivo: string;
+  createdAt: string;
+};
+
+type Exchange = {
+  id: string;
+  millId: string;
+  date: string;
+  hour: string;
+  mangas: number[]; // posições trocadas
+  responsavel: string;
+  motivo: string;
+  observacao: string;
+  createdAt: string;
+};
+
+function makeIsStopped(downtimes: Downtime[]) {
+  return (date: string, shift: Shift, millId: string) =>
+    downtimes.some(
+      (d) =>
+        date >= d.dateFrom &&
+        date <= d.dateTo &&
+        d.shifts.includes(shift) &&
+        (d.millId === "" || d.millId === millId),
+    );
+}
+
 // Data local (evita virar o dia antes da meia-noite por causa do UTC)
 function todayISO() {
   return localISO(new Date());
@@ -160,11 +207,21 @@ function Index() {
     mills: initialMills,
     washes: initialWashes,
     people: initialPeople,
+    downtimes: initialDowntimes,
+    exchanges: initialExchanges,
   } = Route.useLoaderData();
   const [records, setRecords] = useState<Record[]>(initialRecords);
   const [mills, setMills] = useState<Mill[]>(initialMills);
   const [washes, setWashes] = useState<Wash[]>(initialWashes);
   const [people, setPeople] = useState<Person[]>(initialPeople);
+  const [downtimes, setDowntimes] = useState<Downtime[]>(initialDowntimes);
+  const [exchanges, setExchanges] = useState<Exchange[]>(initialExchanges);
+  const isStopped = useMemo(() => makeIsStopped(downtimes), [downtimes]);
+
+  const addDowntimeFn = useServerFn(addDowntimeServerFn);
+  const deleteDowntimeFn = useServerFn(deleteDowntimeServerFn);
+  const addExchangeFn = useServerFn(addExchangeServerFn);
+  const deleteExchangeFn = useServerFn(deleteExchangeServerFn);
 
   const addRecordFn = useServerFn(addRecordServerFn);
   const deleteRecordFn = useServerFn(deleteRecordServerFn);
@@ -190,6 +247,7 @@ function Index() {
     | "historico"
     | "pendencias"
     | "lavagem"
+    | "trocas"
     | "moinhos"
     | "responsaveis"
   >("dashboard");
@@ -237,62 +295,83 @@ function Index() {
   const activeMills = mills.filter((m) => millFilter.includes(m.id));
   const activeShifts = SHIFTS.filter((s) => shiftFilter.includes(s));
   const totalDias = daysBetween(from, to);
-  const esperadoPorMoinho = totalDias * activeShifts.length;
-  const esperadoTotal = esperadoPorMoinho * activeMills.length;
+  const days = useMemo(
+    () => Array.from({ length: totalDias }, (_, i) => addDaysISO(from, i)),
+    [from, totalDias],
+  );
+  // Esperado = combinações dia × turno × moinho, descontando as paradas.
+  const expected = (millIds: string[], dayList: string[], shifts: Shift[]) => {
+    let n = 0;
+    for (const d of dayList)
+      for (const s of shifts)
+        for (const id of millIds) if (!isStopped(d, s, id)) n++;
+    return n;
+  };
+  const activeMillIds = activeMills.map((m) => m.id);
+  // Registros feitos em turno parado não contam para a aderência.
+  const countsForAder = (r: Record) => !isStopped(r.date, r.shift, r.millId);
+  const aderPct = (feitos: number, esperado: number) =>
+    esperado ? Math.min(100, (feitos / esperado) * 100) : 0;
 
   const perMill = activeMills.map((m) => {
     const recs = filtered.filter((r) => r.millId === m.id);
     const feitos = recs.length;
+    const esperado = expected([m.id], days, activeShifts);
     const conformes = recs.filter((r) => r.mangas.every((x) => x === "C")).length;
     const naoConformes = feitos - conformes;
-    const aderencia = esperadoPorMoinho ? (feitos / esperadoPorMoinho) * 100 : 0;
+    const aderencia = aderPct(recs.filter(countsForAder).length, esperado);
     const conformidade = feitos ? (conformes / feitos) * 100 : 0;
-    return { mill: m, feitos, conformes, naoConformes, aderencia, conformidade };
+    return { mill: m, feitos, esperado, conformes, naoConformes, aderencia, conformidade };
   });
+  const esperadoTotal = perMill.reduce((a, p) => a + p.esperado, 0);
+  const paradosTotal = days.length * activeShifts.length * activeMills.length - esperadoTotal;
 
   const totalFeitos = filtered.length;
   const totalConformes = filtered.filter((r) => r.mangas.every((x) => x === "C")).length;
-  const aderenciaGeral = esperadoTotal ? (totalFeitos / esperadoTotal) * 100 : 0;
+  const aderenciaGeral = aderPct(filtered.filter(countsForAder).length, esperadoTotal);
   const conformidadeGeral = totalFeitos ? (totalConformes / totalFeitos) * 100 : 0;
 
   // Série por data
-  const perDate = useMemo(() => {
-    const map = new Map<string, { date: string; feitos: number; conformes: number }>();
-    for (let i = 0; i < totalDias; i++) {
-      const iso = addDaysISO(from, i);
-      map.set(iso, { date: iso, feitos: 0, conformes: 0 });
-    }
+  const perDate = (() => {
+    const map = new Map<
+      string,
+      { date: string; feitos: number; feitosAder: number; conformes: number }
+    >();
+    for (const iso of days) map.set(iso, { date: iso, feitos: 0, feitosAder: 0, conformes: 0 });
     for (const r of filtered) {
       const row = map.get(r.date);
       if (!row) continue;
       row.feitos += 1;
+      if (countsForAder(r)) row.feitosAder += 1;
       if (r.mangas.every((x) => x === "C")) row.conformes += 1;
     }
-    const esperadoDia = activeMills.length * activeShifts.length;
-    return Array.from(map.values()).map((row) => ({
-      date: row.date.slice(5),
-      feitos: row.feitos,
-      conformes: row.conformes,
-      naoConformes: row.feitos - row.conformes,
-      aderencia: esperadoDia ? +((row.feitos / esperadoDia) * 100).toFixed(1) : 0,
-      conformidade: row.feitos
-        ? +((row.conformes / row.feitos) * 100).toFixed(1)
-        : 0,
-    }));
-  }, [filtered, from, totalDias, activeMills.length, activeShifts.length]);
+    return Array.from(map.values()).map((row) => {
+      const esperadoDia = expected(activeMillIds, [row.date], activeShifts);
+      return {
+        date: row.date.slice(5),
+        feitos: row.feitos,
+        conformes: row.conformes,
+        naoConformes: row.feitos - row.conformes,
+        aderencia: +aderPct(row.feitosAder, esperadoDia).toFixed(1),
+        conformidade: row.feitos
+          ? +((row.conformes / row.feitos) * 100).toFixed(1)
+          : 0,
+      };
+    });
+  })();
 
   // Por turno
   const perShift = activeShifts.map((s) => {
     const recs = filtered.filter((r) => r.shift === s);
     const feitos = recs.length;
     const conformes = recs.filter((r) => r.mangas.every((x) => x === "C")).length;
-    const esperado = totalDias * activeMills.length;
+    const esperado = expected(activeMillIds, days, [s]);
     return {
       turno: `Turno ${s}`,
       feitos,
       conformes,
       naoConformes: feitos - conformes,
-      aderencia: esperado ? +((feitos / esperado) * 100).toFixed(1) : 0,
+      aderencia: +aderPct(recs.filter(countsForAder).length, esperado).toFixed(1),
       conformidade: feitos ? +((conformes / feitos) * 100).toFixed(1) : 0,
     };
   });
@@ -313,6 +392,7 @@ function Index() {
       for (const s of activeShifts) {
         if (shiftEnd(iso, s) > now) continue; // turno ainda não terminou
         for (const m of activeMills) {
+          if (isStopped(iso, s, m.id)) continue; // moinho parado
           if (!done.has(`${iso}|${s}|${m.id}`)) {
             list.push({ date: iso, shift: s, mill: m });
           }
@@ -320,7 +400,7 @@ function Index() {
       }
     }
     return list.sort((a, b) => (b.date + b.shift).localeCompare(a.date + a.shift));
-  }, [records, from, to, millFilter, shiftFilter, totalDias, activeShifts, activeMills]);
+  }, [records, from, to, millFilter, shiftFilter, totalDias, activeShifts, activeMills, isStopped]);
 
   const pendenciasPorTurno = activeShifts.map((s) => ({
     turno: `Turno ${s}`,
@@ -398,6 +478,35 @@ function Index() {
     deleteWashFn({ data: { id } }).catch((err) => console.error(err));
   };
 
+  const addDowntime = async (d: Downtime) => {
+    await addDowntimeFn({ data: d });
+    setDowntimes((prev) =>
+      [d, ...prev].sort((a, b) => b.dateFrom.localeCompare(a.dateFrom)),
+    );
+  };
+  const removeDowntime = (id: string) => {
+    setDowntimes((prev) => prev.filter((d) => d.id !== id));
+    deleteDowntimeFn({ data: { id } }).catch((err) => console.error(err));
+  };
+
+  const addExchange = (x: Exchange) => {
+    setExchanges((prev) =>
+      [x, ...prev].sort((a, b) => (b.date + b.hour).localeCompare(a.date + a.hour)),
+    );
+    addExchangeFn({ data: x }).catch((err) => {
+      console.error(err);
+      setExchanges((prev) => prev.filter((e) => e.id !== x.id));
+    });
+  };
+  const removeExchange = (id: string) => {
+    setExchanges((prev) => prev.filter((e) => e.id !== id));
+    deleteExchangeFn({ data: { id } }).catch((err) => console.error(err));
+  };
+
+  const trocasPeriodo = exchanges
+    .filter((x) => x.date >= from && x.date <= to && millFilter.includes(x.millId))
+    .sort((a, b) => (b.date + b.hour).localeCompare(a.date + a.hour));
+
   const addPerson = async (p: Omit<Person, "id">) => {
     const created = await addPersonFn({ data: p });
     setPeople((prev) =>
@@ -455,7 +564,7 @@ function Index() {
           Area: r.mill.area,
           Mangas: r.mill.mangas,
           Feitos: r.feitos,
-          Esperado: esperadoPorMoinho,
+          Esperado: r.esperado,
           Conformes: r.conformes,
           "Não Conformes": r.naoConformes,
           "Aderência %": +r.aderencia.toFixed(1),
@@ -521,6 +630,41 @@ function Index() {
       ),
       "Lavagem - Registros",
     );
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        trocasPeriodo.map((x) => {
+          const m = mills.find((mm) => mm.id === x.millId);
+          return {
+            Data: formatBR(x.date),
+            Hora: x.hour,
+            Area: m?.area,
+            Moinho: m?.name,
+            "Mangas trocadas": x.mangas.join(", "),
+            Quantidade: x.mangas.length,
+            Responsável: x.responsavel,
+            Motivo: x.motivo,
+            Observação: x.observacao,
+          };
+        }),
+      ),
+      "Trocas de mangas",
+    );
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        downtimes
+          .filter((d) => d.dateTo >= from && d.dateFrom <= to)
+          .map((d) => ({
+            De: formatBR(d.dateFrom),
+            Até: formatBR(d.dateTo),
+            Moinho: downtimeMillLabel(d, mills),
+            Turnos: d.shifts.join(", "),
+            Motivo: d.motivo,
+          })),
+      ),
+      "Paradas",
+    );
     XLSX.writeFile(wb, `aderencia_limpeza_${from}_a_${to}.xlsx`);
   };
 
@@ -550,7 +694,7 @@ function Index() {
         r.mill.area,
         r.mill.mangas,
         r.feitos,
-        esperadoPorMoinho,
+        r.esperado,
         r.conformes,
         r.naoConformes,
         r.aderencia.toFixed(1),
@@ -704,6 +848,45 @@ function Index() {
       styles: { fontSize: 8 },
       headStyles: { fillColor: [30, 90, 50] },
     });
+    if (trocasPeriodo.length > 0) {
+      y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+      autoTable(doc, {
+        startY: y,
+        head: [["Troca de mangas", "Hora", "Moinho", "Mangas", "Qtd.", "Responsável", "Motivo", "Observação"]],
+        body: trocasPeriodo.map((x) => {
+          const m = mills.find((mm) => mm.id === x.millId);
+          return [
+            formatBR(x.date),
+            x.hour,
+            m?.name ?? "",
+            x.mangas.join(", "),
+            x.mangas.length,
+            x.responsavel,
+            x.motivo,
+            x.observacao,
+          ];
+        }),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [30, 90, 50] },
+      });
+    }
+    const paradasPeriodo = downtimes.filter((d) => d.dateTo >= from && d.dateFrom <= to);
+    if (paradasPeriodo.length > 0) {
+      y = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 20;
+      autoTable(doc, {
+        startY: y,
+        head: [["Parada — de", "Até", "Moinho", "Turnos", "Motivo"]],
+        body: paradasPeriodo.map((d) => [
+          formatBR(d.dateFrom),
+          formatBR(d.dateTo),
+          downtimeMillLabel(d, mills),
+          d.shifts.join(", "),
+          d.motivo,
+        ]),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [30, 90, 50] },
+      });
+    }
     doc.save(`aderencia_limpeza_${from}_a_${to}.pdf`);
   };
 
@@ -732,6 +915,7 @@ function Index() {
                 ["historico", "Histórico"],
                 ["pendencias", "Pendências"],
                 ["lavagem", "Lavagem"],
+                ["trocas", "Troca de mangas"],
                 ["moinhos", "Moinhos"],
                 ["responsaveis", "Responsáveis"],
               ] as const
@@ -756,6 +940,7 @@ function Index() {
         <ShiftAlerts
           records={records}
           mills={mills}
+          isStopped={isStopped}
           onRegister={() => setTab("novo")}
           onPendencias={() => setTab("pendencias")}
         />
@@ -774,6 +959,7 @@ function Index() {
               <p className="ml-auto text-xs text-muted-foreground">
                 Esperado: {activeShifts.length} turno(s)/dia × {activeMills.length} moinho(s) ={" "}
                 <strong>{esperadoTotal}</strong> registros
+                {paradosTotal > 0 && ` (${paradosTotal} turno(s) parado(s) descontados)`}
               </p>
               <div className="flex gap-2">
                 <button
@@ -949,7 +1135,7 @@ function Index() {
                       <td className="px-4 py-3 text-muted-foreground">{row.mill.area}</td>
                       <td className="px-4 py-3 text-center">{row.mill.mangas}</td>
                       <td className="px-4 py-3 text-center">
-                        {row.feitos} / {esperadoPorMoinho}
+                        {row.feitos} / {row.esperado}
                       </td>
                       <td className="px-4 py-3">
                         <Bar value={row.aderencia} />
@@ -1130,6 +1316,26 @@ function Index() {
             porTurno={pendenciasPorTurno}
             porMoinho={pendenciasPorMoinho}
             porDia={pendenciasPorDia}
+            mills={mills}
+            downtimes={downtimes}
+            onAddDowntime={addDowntime}
+            onDeleteDowntime={removeDowntime}
+          />
+        )}
+
+        {tab === "trocas" && (
+          <TrocasTab
+            from={from}
+            to={to}
+            setFrom={setFrom}
+            setTo={setTo}
+            isCurrentMonth={isCurrentMonth}
+            onCurrentMonth={setCurrentMonth}
+            mills={mills}
+            people={people}
+            trocas={trocasPeriodo}
+            onAdd={addExchange}
+            onDelete={removeExchange}
           />
         )}
 
@@ -1803,6 +2009,10 @@ function PendenciasTab({
   porTurno,
   porMoinho,
   porDia,
+  mills,
+  downtimes,
+  onAddDowntime,
+  onDeleteDowntime,
 }: {
   from: string;
   to: string;
@@ -1810,9 +2020,19 @@ function PendenciasTab({
   porTurno: { turno: string; pendencias: number }[];
   porMoinho: { moinho: string; pendencias: number }[];
   porDia: { date: string; count: number }[];
+  mills: Mill[];
+  downtimes: Downtime[];
+  onAddDowntime: (d: Downtime) => Promise<void>;
+  onDeleteDowntime: (id: string) => void;
 }) {
   return (
     <section className="space-y-6">
+      <DowntimeManager
+        mills={mills}
+        downtimes={downtimes}
+        onAdd={onAddDowntime}
+        onDelete={onDeleteDowntime}
+      />
       <div>
         <h2 className="text-lg font-semibold">
           Pendências — limpezas não registradas
@@ -2834,11 +3054,13 @@ function PeopleManager({
 function ShiftAlerts({
   records,
   mills,
+  isStopped,
   onRegister,
   onPendencias,
 }: {
   records: Record[];
   mills: Mill[];
+  isStopped: (date: string, shift: Shift, millId: string) => boolean;
   onRegister: () => void;
   onPendencias: () => void;
 }) {
@@ -2855,7 +3077,9 @@ function ShiftAlerts({
 
   const done = new Set(records.map((r) => `${r.date}|${r.shift}|${r.millId}`));
   const missingFor = (date: string, shift: Shift) =>
-    mills.filter((m) => !done.has(`${date}|${shift}|${m.id}`));
+    mills.filter(
+      (m) => !done.has(`${date}|${shift}|${m.id}`) && !isStopped(date, shift, m.id),
+    );
 
   const current = currentShift(now);
   const currentMissing = missingFor(current.date, current.shift);
@@ -2945,5 +3169,572 @@ function ShiftAlerts({
         </ul>
       )}
     </div>
+  );
+}
+
+function downtimeMillLabel(d: Downtime, mills: Mill[]) {
+  if (d.millId === "") return "Todos os moinhos";
+  return mills.find((m) => m.id === d.millId)?.name ?? "Moinho excluído";
+}
+
+// Lançamento de dias/turnos parados: esses turnos não viram pendência
+// e saem do esperado da aderência.
+function DowntimeManager({
+  mills,
+  downtimes,
+  onAdd,
+  onDelete,
+}: {
+  mills: Mill[];
+  downtimes: Downtime[];
+  onAdd: (d: Downtime) => Promise<void>;
+  onDelete: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [millId, setMillId] = useState("");
+  const [dateFrom, setDateFrom] = useState(todayISO);
+  const [dateTo, setDateTo] = useState(todayISO);
+  const [shifts, setShifts] = useState<Shift[]>(() => [...SHIFTS]);
+  const [motivo, setMotivo] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const toggleShift = (s: Shift) =>
+    setShifts((prev) =>
+      prev.includes(s)
+        ? prev.filter((x) => x !== s)
+        : SHIFTS.filter((x) => x === s || prev.includes(x)),
+    );
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (shifts.length === 0) {
+      setError("Selecione ao menos um turno.");
+      return;
+    }
+    if (dateTo < dateFrom) {
+      setError("A data final deve ser igual ou posterior à data inicial.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await onAdd({
+        id: crypto.randomUUID(),
+        millId,
+        dateFrom,
+        dateTo,
+        shifts,
+        motivo: motivo.trim(),
+        createdAt: new Date().toISOString(),
+      });
+      setMotivo("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Não foi possível salvar a parada.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const recent = open ? downtimes : downtimes.slice(0, 5);
+
+  return (
+    <div className="rounded-xl border border-border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
+        <div>
+          <h3 className="text-sm font-semibold">Dias parados ({downtimes.length})</h3>
+          <p className="text-xs text-muted-foreground">
+            Turnos com o moinho parado não geram pendência e não entram no esperado da
+            aderência.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90"
+        >
+          {open ? "Fechar" : "+ Lançar parada"}
+        </button>
+      </div>
+
+      {open && (
+        <form onSubmit={submit} className="space-y-3 border-b border-border p-4">
+          <div className="grid gap-3 md:grid-cols-4">
+            <Field label="Moinho">
+              <select
+                value={millId}
+                onChange={(e) => setMillId(e.target.value)}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              >
+                <option value="">Todos os moinhos</option>
+                {mills.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.area} — {m.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="De">
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => {
+                  setDateFrom(e.target.value);
+                  if (dateTo < e.target.value) setDateTo(e.target.value);
+                }}
+                required
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </Field>
+            <Field label="Até">
+              <input
+                type="date"
+                value={dateTo}
+                min={dateFrom}
+                onChange={(e) => setDateTo(e.target.value)}
+                required
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </Field>
+            <Field label="Turnos parados">
+              <div className="flex gap-1.5">
+                {SHIFTS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => toggleShift(s)}
+                    className={`flex-1 rounded-md border px-2 py-2 text-sm font-medium transition ${
+                      shifts.includes(s)
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : "border-input bg-background text-muted-foreground hover:bg-muted"
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </Field>
+          </div>
+          <Field label="Motivo">
+            <input
+              value={motivo}
+              onChange={(e) => setMotivo(e.target.value)}
+              placeholder="Ex.: manutenção, falta de matéria-prima, feriado…"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </Field>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              disabled={saving}
+              className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow hover:opacity-90 disabled:opacity-60"
+            >
+              {saving ? "Salvando…" : "Salvar parada"}
+            </button>
+            {saved && <span className="text-sm text-success">✓ Parada salva</span>}
+          </div>
+        </form>
+      )}
+
+      {downtimes.length === 0 ? (
+        <p className="px-4 py-4 text-sm text-muted-foreground">Nenhuma parada lançada.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-secondary text-secondary-foreground">
+              <tr>
+                <th className="px-4 py-2 text-left">Período</th>
+                <th className="px-4 py-2 text-left">Moinho</th>
+                <th className="px-4 py-2 text-left">Turnos</th>
+                <th className="px-4 py-2 text-left">Motivo</th>
+                <th className="px-4 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.map((d) => (
+                <tr key={d.id} className="border-t border-border">
+                  <td className="whitespace-nowrap px-4 py-2">
+                    {d.dateFrom === d.dateTo
+                      ? formatBR(d.dateFrom)
+                      : `${formatBR(d.dateFrom)} a ${formatBR(d.dateTo)}`}
+                  </td>
+                  <td className="px-4 py-2 font-medium">{downtimeMillLabel(d, mills)}</td>
+                  <td className="px-4 py-2">
+                    {d.shifts.length === 3 ? "Todos" : d.shifts.join(", ")}
+                  </td>
+                  <td className="px-4 py-2 text-muted-foreground">{d.motivo}</td>
+                  <td className="px-4 py-2 text-right">
+                    <button
+                      onClick={() => onDelete(d.id)}
+                      className="text-xs text-muted-foreground hover:text-destructive"
+                    >
+                      Excluir
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!open && downtimes.length > recent.length && (
+            <p className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+              Mostrando as 5 mais recentes.{" "}
+              <button onClick={() => setOpen(true)} className="underline hover:text-foreground">
+                Ver todas
+              </button>
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TrocasTab({
+  from,
+  to,
+  setFrom,
+  setTo,
+  isCurrentMonth,
+  onCurrentMonth,
+  mills,
+  people,
+  trocas,
+  onAdd,
+  onDelete,
+}: {
+  from: string;
+  to: string;
+  setFrom: (v: string) => void;
+  setTo: (v: string) => void;
+  isCurrentMonth: boolean;
+  onCurrentMonth: () => void;
+  mills: Mill[];
+  people: Person[];
+  trocas: Exchange[];
+  onAdd: (x: Exchange) => void;
+  onDelete: (id: string) => void;
+}) {
+  const totalMangas = trocas.reduce((a, x) => a + x.mangas.length, 0);
+  const perMill = mills.map((m) => {
+    const list = trocas.filter((x) => x.millId === m.id);
+    return {
+      mill: m,
+      trocas: list.length,
+      mangas: list.reduce((a, x) => a + x.mangas.length, 0),
+    };
+  });
+  const chartData = perMill.map((p) => ({ moinho: p.mill.name, mangas: p.mangas }));
+
+  return (
+    <section className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold">Troca de mangas</h2>
+        <p className="text-sm text-muted-foreground">
+          Registre as mangas substituídas em cada moinho. É possível lançar trocas com data
+          retroativa.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-end gap-3">
+        <PeriodFilter
+          from={from}
+          to={to}
+          setFrom={setFrom}
+          setTo={setTo}
+          isCurrentMonth={isCurrentMonth}
+          onCurrentMonth={onCurrentMonth}
+        />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <KpiCard
+          title="Trocas no período"
+          value={`${trocas.length}`}
+          sub="lançamentos de troca"
+          tone="good"
+        />
+        <KpiCard
+          title="Mangas trocadas"
+          value={`${totalMangas}`}
+          sub="unidades substituídas"
+          tone="good"
+        />
+        <KpiCard
+          title="Moinhos com troca"
+          value={`${perMill.filter((p) => p.trocas > 0).length}`}
+          sub={`de ${mills.length} moinho(s)`}
+          tone="good"
+        />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <NewExchangeForm mills={mills} people={people} onAdd={onAdd} />
+        <ChartCard title="Mangas trocadas por moinho">
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={chartData} margin={{ top: 10, right: 16, bottom: 0, left: -10 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="hsl(0 0% 90%)" />
+              <XAxis dataKey="moinho" fontSize={11} />
+              <YAxis allowDecimals={false} fontSize={11} />
+              <Tooltip />
+              <RBar dataKey="mangas" name="Mangas trocadas" fill="oklch(0.38 0.13 145)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold">
+            Trocas registradas no período ({trocas.length})
+          </h3>
+        </div>
+        {trocas.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted-foreground">
+            Nenhuma troca de mangas registrada no período.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-secondary text-secondary-foreground">
+              <tr>
+                <th className="px-4 py-2 text-left">Data</th>
+                <th className="px-4 py-2 text-left">Hora</th>
+                <th className="px-4 py-2 text-left">Moinho</th>
+                <th className="px-4 py-2 text-left">Mangas trocadas</th>
+                <th className="px-4 py-2 text-left">Responsável</th>
+                <th className="px-4 py-2 text-left">Motivo</th>
+                <th className="px-4 py-2 text-left">Observação</th>
+                <th className="px-4 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {trocas.map((x) => {
+                const mill = mills.find((m) => m.id === x.millId);
+                return (
+                  <tr key={x.id} className="border-t border-border">
+                    <td className="whitespace-nowrap px-4 py-2">{formatBR(x.date)}</td>
+                    <td className="px-4 py-2">{x.hour || "—"}</td>
+                    <td className="px-4 py-2">
+                      {mill?.area} — {mill?.name}
+                    </td>
+                    <td className="px-4 py-2">
+                      <div className="flex flex-wrap gap-1">
+                        {x.mangas.map((n) => (
+                          <span
+                            key={n}
+                            className="inline-flex h-6 min-w-[24px] items-center justify-center rounded bg-primary/10 px-1 text-[10px] font-semibold text-primary"
+                          >
+                            {n}
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2">{x.responsavel}</td>
+                    <td className="px-4 py-2">{x.motivo}</td>
+                    <td className="px-4 py-2 text-muted-foreground">{x.observacao}</td>
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        onClick={() => onDelete(x.id)}
+                        className="text-xs text-muted-foreground hover:text-destructive"
+                      >
+                        Excluir
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+const EXCHANGE_REASONS = ["Desgaste", "Furo / rasgo", "Entupimento", "Preventiva", "Outro"];
+
+function NewExchangeForm({
+  mills,
+  people,
+  onAdd,
+}: {
+  mills: Mill[];
+  people: Person[];
+  onAdd: (x: Exchange) => void;
+}) {
+  const [millId, setMillId] = useState(mills[0]?.id ?? "");
+  const mill = mills.find((m) => m.id === millId) ?? mills[0];
+  const [date, setDate] = useState(todayISO);
+  const [hour, setHour] = useState("");
+  const [selected, setSelected] = useState<number[]>([]);
+  const [responsavel, setResponsavel] = useState("");
+  const [motivo, setMotivo] = useState(EXCHANGE_REASONS[0]);
+  const [observacao, setObservacao] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const today = todayISO();
+  const retroativo = date < today;
+
+  const toggle = (n: number) =>
+    setSelected((prev) =>
+      prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n].sort((a, b) => a - b),
+    );
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mill || !responsavel.trim()) return;
+    if (selected.length === 0) {
+      setError("Selecione ao menos uma manga trocada.");
+      return;
+    }
+    if (date > today) {
+      setError("A data da troca não pode ser no futuro.");
+      return;
+    }
+    setError(null);
+    onAdd({
+      id: crypto.randomUUID(),
+      millId: mill.id,
+      date,
+      hour,
+      mangas: selected,
+      responsavel: responsavel.trim(),
+      motivo,
+      observacao: observacao.trim(),
+      createdAt: new Date().toISOString(),
+    });
+    setSelected([]);
+    setHour("");
+    setObservacao("");
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  if (!mill) {
+    return (
+      <div className="rounded-xl border border-dashed border-border bg-card p-10 text-center text-sm text-muted-foreground">
+        Nenhum moinho cadastrado.
+      </div>
+    );
+  }
+
+  const positions = Array.from({ length: mill.mangas }, (_, i) => i + 1);
+
+  return (
+    <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4">
+      <h3 className="text-sm font-semibold">Registrar troca de mangas</h3>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Moinho">
+          <select
+            value={mill.id}
+            onChange={(e) => {
+              setMillId(e.target.value);
+              setSelected([]);
+            }}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            {mills.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.area} — {m.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Data da troca">
+          <input
+            type="date"
+            value={date}
+            max={today}
+            onChange={(e) => setDate(e.target.value)}
+            required
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+        <Field label="Hora (opcional)">
+          <input
+            type="time"
+            value={hour}
+            onChange={(e) => setHour(e.target.value)}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+        <Field label="Responsável">
+          <PersonSelect value={responsavel} onChange={setResponsavel} people={people} />
+        </Field>
+        <Field label="Motivo">
+          <select
+            value={motivo}
+            onChange={(e) => setMotivo(e.target.value)}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            {EXCHANGE_REASONS.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Observação (opcional)">
+          <input
+            value={observacao}
+            onChange={(e) => setObservacao(e.target.value)}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          />
+        </Field>
+      </div>
+      <div>
+        <div className="mb-1 flex items-center justify-between">
+          <label className="text-xs font-medium text-muted-foreground">
+            Mangas trocadas ({selected.length} de {mill.mangas})
+          </label>
+          <button
+            type="button"
+            onClick={() => setSelected(selected.length === mill.mangas ? [] : positions)}
+            className="rounded border border-input px-2 py-0.5 text-xs hover:bg-muted"
+          >
+            {selected.length === mill.mangas ? "Limpar" : "Todas"}
+          </button>
+        </div>
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
+          {positions.map((n) => {
+            const on = selected.includes(n);
+            return (
+              <button
+                key={n}
+                type="button"
+                onClick={() => toggle(n)}
+                className={`rounded-lg border p-2 text-center text-sm font-semibold transition ${
+                  on
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-input bg-background text-muted-foreground hover:bg-muted"
+                }`}
+              >
+                <div className="text-[10px] font-normal opacity-70">Manga</div>
+                {n}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      {retroativo && (
+        <p className="text-xs text-muted-foreground">
+          Lançamento retroativo: troca realizada em {formatBR(date)}.
+        </p>
+      )}
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow hover:opacity-90"
+        >
+          Salvar troca
+        </button>
+        {saved && <span className="text-sm text-success">✓ Troca salva</span>}
+      </div>
+    </form>
   );
 }
